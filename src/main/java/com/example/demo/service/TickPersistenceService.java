@@ -45,6 +45,7 @@ public class TickPersistenceService {
     private final AngelOneProperties properties;
     private final JdbcTemplate jdbcTemplate;
     private final GreeksCacheService greeksCacheService;
+    private final PremiumReferenceService premiumReferenceService;
 
     /** Single map: tick time -> combined snapshot of NIFTY + all 4 option prices at that time. */
     private final ConcurrentSkipListMap<LocalTime, TickSnapshot> snapshotsByTime = new ConcurrentSkipListMap<>();
@@ -63,23 +64,35 @@ public class TickPersistenceService {
     private volatile Thread snapshotWorker;
     private volatile boolean running;
 
-    public TickPersistenceService(AngelOneProperties properties, DataSource dataSource, GreeksCacheService greeksCacheService) {
+    public TickPersistenceService(AngelOneProperties properties, DataSource dataSource, GreeksCacheService greeksCacheService,
+                                   PremiumReferenceService premiumReferenceService) {
         this.properties = properties;
         this.jdbcTemplate = new JdbcTemplate(dataSource);
         this.greeksCacheService = greeksCacheService;
+        this.premiumReferenceService = premiumReferenceService;
     }
 
     @PostConstruct
     void start() {
         jdbcTemplate.execute("""
                 CREATE TABLE IF NOT EXISTS ticks (
-                    id BIGSERIAL PRIMARY KEY,
-                    label VARCHAR(32) NOT NULL,
-                    token VARCHAR(32),
-                    price DOUBLE PRECISION,
-                    exchange_timestamp_millis BIGINT,
                     tick_date DATE NOT NULL,
-                    tick_time VARCHAR(16)
+                    tick_time VARCHAR(16) NOT NULL,
+                    nifty DOUBLE PRECISION,
+                    atm_ce DOUBLE PRECISION,
+                    atm_ce_strike DOUBLE PRECISION,
+                    atm_ce_delta DOUBLE PRECISION,
+                    atm_pe DOUBLE PRECISION,
+                    atm_pe_strike DOUBLE PRECISION,
+                    atm_pe_delta DOUBLE PRECISION,
+                    fixed_itm_ce DOUBLE PRECISION,
+                    fixed_itm_ce_strike DOUBLE PRECISION,
+                    fixed_itm_ce_delta DOUBLE PRECISION,
+                    fixed_itm_pe DOUBLE PRECISION,
+                    fixed_itm_pe_strike DOUBLE PRECISION,
+                    fixed_itm_pe_delta DOUBLE PRECISION,
+                    nifty_fut DOUBLE PRECISION,
+                    PRIMARY KEY (tick_date, tick_time)
                 )
                 """);
         jdbcTemplate.execute("""
@@ -88,17 +101,26 @@ public class TickPersistenceService {
                     tick_time VARCHAR(16) NOT NULL,
                     nifty DOUBLE PRECISION,
                     atm_ce DOUBLE PRECISION,
+                    atm_ce_strike DOUBLE PRECISION,
                     atm_ce_delta DOUBLE PRECISION,
                     atm_pe DOUBLE PRECISION,
+                    atm_pe_strike DOUBLE PRECISION,
                     atm_pe_delta DOUBLE PRECISION,
                     fixed_itm_ce DOUBLE PRECISION,
+                    fixed_itm_ce_strike DOUBLE PRECISION,
                     fixed_itm_ce_delta DOUBLE PRECISION,
                     fixed_itm_pe DOUBLE PRECISION,
+                    fixed_itm_pe_strike DOUBLE PRECISION,
                     fixed_itm_pe_delta DOUBLE PRECISION,
                     nifty_fut DOUBLE PRECISION,
                     PRIMARY KEY (tick_date, tick_time)
                 )
                 """);
+        // Safety net for pre-existing tables created before the strike columns were added.
+        jdbcTemplate.execute("ALTER TABLE tick_snapshot ADD COLUMN IF NOT EXISTS atm_ce_strike DOUBLE PRECISION");
+        jdbcTemplate.execute("ALTER TABLE tick_snapshot ADD COLUMN IF NOT EXISTS atm_pe_strike DOUBLE PRECISION");
+        jdbcTemplate.execute("ALTER TABLE tick_snapshot ADD COLUMN IF NOT EXISTS fixed_itm_ce_strike DOUBLE PRECISION");
+        jdbcTemplate.execute("ALTER TABLE tick_snapshot ADD COLUMN IF NOT EXISTS fixed_itm_pe_strike DOUBLE PRECISION");
 
         running = true;
         worker = new Thread(this::drainLoop, "tick-persistence-writer");
@@ -159,7 +181,7 @@ public class TickPersistenceService {
         LocalTime time = LocalTime.parse(tick.tickTime(), TICK_TIME_PARSER);
         Double delta = greeksCacheService.getDelta(tick.label());
         TickSnapshot updated = snapshotsByTime.compute(time, (t, existing) ->
-                (existing != null ? existing : TickSnapshot.empty(t)).with(tick.label(), tick.price(), delta));
+                (existing != null ? existing : TickSnapshot.empty(t)).with(tick.label(), tick.price(), tick.strike(), delta));
         if (!queue.offer(tick)) {
             log.warn("Tick persistence queue is full; dropping tick for {}", tick.label());
         }
@@ -168,6 +190,7 @@ public class TickPersistenceService {
         }
         if (updated.isComplete()) {
             latestCompleteSnapshot = updated;
+            premiumReferenceService.captureIfNeeded(updated);
         }
     }
 
@@ -217,11 +240,45 @@ public class TickPersistenceService {
         }
     }
 
-    /** Appends the raw tick as a new row in the {@code ticks} table (one row per tick received), dated today. */
+    /** Upserts the raw tick into the {@code ticks} table, keyed by (tick_date, tick_time). Only the column(s)
+     * matching this tick's label are written/overwritten; every other label's columns for that row are left
+     * untouched (or default to NULL on first insert for that time). This gives a wide, TickSnapshot-shaped row
+     * per time that fills in progressively as each label ticks, as opposed to {@code tick_snapshot} which only
+     * gets a row once every label is present. */
     private void persist(TickRecord tick) {
-        jdbcTemplate.update(
-                "INSERT INTO ticks (label, token, price, exchange_timestamp_millis, tick_date, tick_time) VALUES (?, ?, ?, ?, ?, ?)",
-                tick.label(), tick.token(), tick.price(), tick.exchangeTimestampMillis(), LocalDate.now(), tick.tickTime());
+        Double delta = greeksCacheService.getDelta(tick.label());
+        LocalDate today = LocalDate.now();
+        switch (tick.label()) {
+            case "NIFTY" -> jdbcTemplate.update("""
+                    INSERT INTO ticks (tick_date, tick_time, nifty) VALUES (?, ?, ?)
+                    ON CONFLICT (tick_date, tick_time) DO UPDATE SET nifty = EXCLUDED.nifty
+                    """, today, tick.tickTime(), tick.price());
+            case "ATM CE" -> jdbcTemplate.update("""
+                    INSERT INTO ticks (tick_date, tick_time, atm_ce, atm_ce_strike, atm_ce_delta) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (tick_date, tick_time) DO UPDATE SET
+                        atm_ce = EXCLUDED.atm_ce, atm_ce_strike = EXCLUDED.atm_ce_strike, atm_ce_delta = EXCLUDED.atm_ce_delta
+                    """, today, tick.tickTime(), tick.price(), tick.strike(), delta);
+            case "ATM PE" -> jdbcTemplate.update("""
+                    INSERT INTO ticks (tick_date, tick_time, atm_pe, atm_pe_strike, atm_pe_delta) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (tick_date, tick_time) DO UPDATE SET
+                        atm_pe = EXCLUDED.atm_pe, atm_pe_strike = EXCLUDED.atm_pe_strike, atm_pe_delta = EXCLUDED.atm_pe_delta
+                    """, today, tick.tickTime(), tick.price(), tick.strike(), delta);
+            case "FIXED ITM CE" -> jdbcTemplate.update("""
+                    INSERT INTO ticks (tick_date, tick_time, fixed_itm_ce, fixed_itm_ce_strike, fixed_itm_ce_delta) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (tick_date, tick_time) DO UPDATE SET
+                        fixed_itm_ce = EXCLUDED.fixed_itm_ce, fixed_itm_ce_strike = EXCLUDED.fixed_itm_ce_strike, fixed_itm_ce_delta = EXCLUDED.fixed_itm_ce_delta
+                    """, today, tick.tickTime(), tick.price(), tick.strike(), delta);
+            case "FIXED ITM PE" -> jdbcTemplate.update("""
+                    INSERT INTO ticks (tick_date, tick_time, fixed_itm_pe, fixed_itm_pe_strike, fixed_itm_pe_delta) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (tick_date, tick_time) DO UPDATE SET
+                        fixed_itm_pe = EXCLUDED.fixed_itm_pe, fixed_itm_pe_strike = EXCLUDED.fixed_itm_pe_strike, fixed_itm_pe_delta = EXCLUDED.fixed_itm_pe_delta
+                    """, today, tick.tickTime(), tick.price(), tick.strike(), delta);
+            case "NIFTY FUT" -> jdbcTemplate.update("""
+                    INSERT INTO ticks (tick_date, tick_time, nifty_fut) VALUES (?, ?, ?)
+                    ON CONFLICT (tick_date, tick_time) DO UPDATE SET nifty_fut = EXCLUDED.nifty_fut
+                    """, today, tick.tickTime(), tick.price());
+            default -> log.warn("Unrecognized tick label '{}', skipping ticks table upsert", tick.label());
+        }
     }
 
     /** Upserts a completed snapshot (all tracked labels populated) as one row in the {@code tick_snapshot} table,
@@ -229,24 +286,34 @@ public class TickPersistenceService {
     private void persistSnapshot(TickSnapshot snapshot) {
         jdbcTemplate.update("""
                 INSERT INTO tick_snapshot (
-                    tick_date, tick_time, nifty, atm_ce, atm_ce_delta, atm_pe, atm_pe_delta,
-                    fixed_itm_ce, fixed_itm_ce_delta, fixed_itm_pe, fixed_itm_pe_delta, nifty_fut
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    tick_date, tick_time, nifty,
+                    atm_ce, atm_ce_strike, atm_ce_delta,
+                    atm_pe, atm_pe_strike, atm_pe_delta,
+                    fixed_itm_ce, fixed_itm_ce_strike, fixed_itm_ce_delta,
+                    fixed_itm_pe, fixed_itm_pe_strike, fixed_itm_pe_delta,
+                    nifty_fut
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (tick_date, tick_time) DO UPDATE SET
                     nifty = EXCLUDED.nifty,
                     atm_ce = EXCLUDED.atm_ce,
+                    atm_ce_strike = EXCLUDED.atm_ce_strike,
                     atm_ce_delta = EXCLUDED.atm_ce_delta,
                     atm_pe = EXCLUDED.atm_pe,
+                    atm_pe_strike = EXCLUDED.atm_pe_strike,
                     atm_pe_delta = EXCLUDED.atm_pe_delta,
                     fixed_itm_ce = EXCLUDED.fixed_itm_ce,
+                    fixed_itm_ce_strike = EXCLUDED.fixed_itm_ce_strike,
                     fixed_itm_ce_delta = EXCLUDED.fixed_itm_ce_delta,
                     fixed_itm_pe = EXCLUDED.fixed_itm_pe,
+                    fixed_itm_pe_strike = EXCLUDED.fixed_itm_pe_strike,
                     fixed_itm_pe_delta = EXCLUDED.fixed_itm_pe_delta,
                     nifty_fut = EXCLUDED.nifty_fut
                 """,
                 LocalDate.now(), snapshot.tickTime().toString(), snapshot.nifty(),
-                snapshot.atmCe(), snapshot.atmCeDelta(), snapshot.atmPe(), snapshot.atmPeDelta(),
-                snapshot.fixedItmCe(), snapshot.fixedItmCeDelta(), snapshot.fixedItmPe(), snapshot.fixedItmPeDelta(),
+                snapshot.atmCe(), snapshot.atmCeStrike(), snapshot.atmCeDelta(),
+                snapshot.atmPe(), snapshot.atmPeStrike(), snapshot.atmPeDelta(),
+                snapshot.fixedItmCe(), snapshot.fixedItmCeStrike(), snapshot.fixedItmCeDelta(),
+                snapshot.fixedItmPe(), snapshot.fixedItmPeStrike(), snapshot.fixedItmPeDelta(),
                 snapshot.niftyFut());
     }
 }

@@ -77,6 +77,10 @@ public class AngelOneMarketDataService {
                 "ATM CE", atmCe.token(), "ATM PE", atmPe.token(),
                 "FIXED ITM CE", fixedItmCe.token(), "FIXED ITM PE", fixedItmPe.token(),
                 "NIFTY FUT", niftyFut.token());
+        this.optionContractsByLabel = Map.of(
+                "ATM CE", atmCe, "ATM PE", atmPe,
+                "FIXED ITM CE", fixedItmCe, "FIXED ITM PE", fixedItmPe,
+                "NIFTY FUT", niftyFut);
 
         HttpClient httpClient = HttpClient.newHttpClient();
         TickListener listener = new TickListener();
@@ -218,12 +222,14 @@ public class AngelOneMarketDataService {
 
         if (exchangeType == EXCHANGE_TYPE_NSE_CM && token.equals(properties.getNiftyToken())) {
             log.info("NIFTY = {} @ {}", price, tickTime);
-            tickPersistenceService.offer(new TickRecord("NIFTY", token, price, exchangeTimestampMillis, tickTime));
+            tickPersistenceService.offer(new TickRecord("NIFTY", token, price, 0.0, exchangeTimestampMillis, tickTime));
         } else if (exchangeType == EXCHANGE_TYPE_NSE_FO) {
             optionTokensByLabel.forEach((label, selectedToken) -> {
                 if (token.equals(selectedToken)) {
+                    OptionContract contract = optionContractsByLabel.get(label);
+                    double strike = contract != null ? contract.strike() : 0.0;
                     log.info("{} = {} @ {}", label, price, tickTime);
-                    tickPersistenceService.offer(new TickRecord(label, token, price, exchangeTimestampMillis, tickTime));
+                    tickPersistenceService.offer(new TickRecord(label, token, price, strike, exchangeTimestampMillis, tickTime));
                 }
             });
         }
