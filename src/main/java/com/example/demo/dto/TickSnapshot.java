@@ -20,27 +20,36 @@ public record TickSnapshot(
         Double fixedItmCe,
         Double fixedItmCeDelta,
         Double fixedItmPe,
-        Double fixedItmPeDelta
+        Double fixedItmPeDelta,
+        Double niftyFut
 ) {
     public static TickSnapshot empty(LocalTime tickTime) {
-        return new TickSnapshot(tickTime, null, null, null, null, null, null, null, null, null);
+        return new TickSnapshot(tickTime, null, null, null, null, null, null, null, null, null, null);
     }
 
     /** Returns a copy with the given label's price (and cached Delta, if any) updated; other fields are preserved. */
     public TickSnapshot with(String label, double price, Double delta) {
         return switch (label) {
             case "NIFTY" -> new TickSnapshot(tickTime, price, atmCe, atmCeDelta, atmPe, atmPeDelta,
-                    fixedItmCe, fixedItmCeDelta, fixedItmPe, fixedItmPeDelta);
+                    fixedItmCe, fixedItmCeDelta, fixedItmPe, fixedItmPeDelta, niftyFut);
             case "ATM CE" -> new TickSnapshot(tickTime, nifty, price, delta != null ? delta : atmCeDelta,
-                    atmPe, atmPeDelta, fixedItmCe, fixedItmCeDelta, fixedItmPe, fixedItmPeDelta);
+                    atmPe, atmPeDelta, fixedItmCe, fixedItmCeDelta, fixedItmPe, fixedItmPeDelta, niftyFut);
             case "ATM PE" -> new TickSnapshot(tickTime, nifty, atmCe, atmCeDelta,
-                    price, delta != null ? delta : atmPeDelta, fixedItmCe, fixedItmCeDelta, fixedItmPe, fixedItmPeDelta);
+                    price, delta != null ? delta : atmPeDelta, fixedItmCe, fixedItmCeDelta, fixedItmPe, fixedItmPeDelta, niftyFut);
             case "FIXED ITM CE" -> new TickSnapshot(tickTime, nifty, atmCe, atmCeDelta, atmPe, atmPeDelta,
-                    price, delta != null ? delta : fixedItmCeDelta, fixedItmPe, fixedItmPeDelta);
+                    price, delta != null ? delta : fixedItmCeDelta, fixedItmPe, fixedItmPeDelta, niftyFut);
             case "FIXED ITM PE" -> new TickSnapshot(tickTime, nifty, atmCe, atmCeDelta, atmPe, atmPeDelta,
-                    fixedItmCe, fixedItmCeDelta, price, delta != null ? delta : fixedItmPeDelta);
+                    fixedItmCe, fixedItmCeDelta, price, delta != null ? delta : fixedItmPeDelta, niftyFut);
+            case "NIFTY FUT" -> new TickSnapshot(tickTime, nifty, atmCe, atmCeDelta, atmPe, atmPeDelta,
+                    fixedItmCe, fixedItmCeDelta, fixedItmPe, fixedItmPeDelta, price);
             default -> this;
         };
+    }
+
+    /** True once every tracked label (NIFTY, ATM CE/PE, FIXED ITM CE/PE and NIFTY FUT) has a price for this tick time. */
+    public boolean isComplete() {
+        return nifty != null && atmCe != null && atmPe != null
+                && fixedItmCe != null && fixedItmPe != null && niftyFut != null;
     }
 }
 

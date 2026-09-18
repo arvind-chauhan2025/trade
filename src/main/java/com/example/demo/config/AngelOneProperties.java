@@ -54,7 +54,6 @@ public class AngelOneProperties {
 
     private int itmDepth = 1;
     private String fixedItmStatePath = "data/fixed-itm.json";
-    private String tickExportPath = "data/ticks-export.json";
     private int tickHistorySize = 500;
 
     public int getTickHistorySize() {
@@ -63,14 +62,6 @@ public class AngelOneProperties {
 
     public void setTickHistorySize(int tickHistorySize) {
         this.tickHistorySize = tickHistorySize;
-    }
-
-    public String getTickExportPath() {
-        return tickExportPath;
-    }
-
-    public void setTickExportPath(String tickExportPath) {
-        this.tickExportPath = tickExportPath;
     }
 
     public int getItmDepth() {

@@ -63,18 +63,20 @@ public class AngelOneMarketDataService {
 
     private volatile WebSocket webSocket;
     private volatile Map<String, String> optionTokensByLabel = Map.of();
+    private volatile Map<String, OptionContract> optionContractsByLabel = Map.of();
 
     public AngelOneMarketDataService(AngelOneProperties properties, TickPersistenceService tickPersistenceService) {
         this.properties = properties;
         this.tickPersistenceService = tickPersistenceService;
     }
 
-    /** Subscribes to NIFTY spot, startup ATM CE/PE and the pinned weekly ITM CE/PE. */
+    /** Subscribes to NIFTY spot, startup ATM CE/PE, the pinned weekly ITM CE/PE, and the nearest NIFTY future. */
     public void start(String jwtToken, String feedToken, OptionContract atmCe, OptionContract atmPe,
-                      OptionContract fixedItmCe, OptionContract fixedItmPe) {
+                      OptionContract fixedItmCe, OptionContract fixedItmPe, OptionContract niftyFut) {
         this.optionTokensByLabel = Map.of(
                 "ATM CE", atmCe.token(), "ATM PE", atmPe.token(),
-                "FIXED ITM CE", fixedItmCe.token(), "FIXED ITM PE", fixedItmPe.token());
+                "FIXED ITM CE", fixedItmCe.token(), "FIXED ITM PE", fixedItmPe.token(),
+                "NIFTY FUT", niftyFut.token());
 
         HttpClient httpClient = HttpClient.newHttpClient();
         TickListener listener = new TickListener();

@@ -112,6 +112,10 @@ public class TradingApplication implements ApplicationRunner {
             log.info("ATM PE selected: symbol={} token={} strike={} expiry={}",
                     atmPe.symbol(), atmPe.token(), atmPe.strike(), atmPe.expiry());
 
+            OptionContract niftyFut = scripMasterService.getNearestNiftyFuture();
+            log.info("NIFTY FUT selected: symbol={} token={} expiry={}",
+                    niftyFut.symbol(), niftyFut.token(), niftyFut.expiry());
+
             String jwtToken = angelOneAuthService.getJwtToken();
             String feedToken = angelOneAuthService.getFeedToken();
 
@@ -126,9 +130,9 @@ public class TradingApplication implements ApplicationRunner {
                 log.warn("Failed to fetch Option Greeks; Delta will be unavailable for this session", ex);
             }
 
-            angelOneMarketDataService.start(jwtToken, feedToken, atmCe, atmPe, fixed.ce(), fixed.pe());
+            angelOneMarketDataService.start(jwtToken, feedToken, atmCe, atmPe, fixed.ce(), fixed.pe(), niftyFut);
             pipelineActive.set(true);
-            log.info("SmartStream subscription initiated for NIFTY, ATM CE/PE and fixed ITM CE/PE");
+            log.info("SmartStream subscription initiated for NIFTY, ATM CE/PE, fixed ITM CE/PE and NIFTY FUT");
         } catch (Exception ex) {
             log.error("Failed to bootstrap NIFTY trading pipeline", ex);
         }

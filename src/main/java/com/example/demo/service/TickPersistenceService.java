@@ -3,7 +3,6 @@ package com.example.demo.service;
 import com.example.demo.config.AngelOneProperties;
 import com.example.demo.dto.TickRecord;
 import com.example.demo.dto.TickSnapshot;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
@@ -12,33 +11,30 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 import javax.sql.DataSource;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
+import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Stores every tick in a single {@code Map<LocalTime, TickSnapshot>}, keyed
  * by the exchange tick time. Each snapshot combines the NIFTY index price
- * (NSE_CM) together with the four option prices (NSE_FO) that occurred at
- * that same second — whichever field a tick belongs to is simply updated in
- * place; there is no separate override logic needed.
+ * (NSE_CM) together with the four option prices and the NIFTY future price
+ * (NSE_FO) that occurred at that same second — whichever field a tick
+ * belongs to is simply updated in place; there is no separate override logic
+ * needed. Whenever a snapshot becomes fully populated (every tracked label
+ * has a price), it is additionally pushed onto {@link #snapshotQueue} for
+ * consumers that only care about complete snapshots.
  * <p>
- * Every update is also asynchronously upserted into a single H2 table via a
- * background-drained queue, so the WebSocket thread is never blocked by DB
- * I/O. On shutdown, the full table is exported to a JSON file. This class is
- * a stand-in for a future proper database/repository layer.
+ * Every update is also asynchronously persisted into Postgres via
+ * background-drained queues, so the WebSocket thread is never blocked by DB
+ * I/O. Both tables key on {@code tick_date} + {@code tick_time} so ticks
+ * from different trading days never collide. This class is a stand-in for a
+ * future proper database/repository layer.
  */
 @Service
 public class TickPersistenceService {
@@ -49,18 +45,22 @@ public class TickPersistenceService {
     private final AngelOneProperties properties;
     private final JdbcTemplate jdbcTemplate;
     private final GreeksCacheService greeksCacheService;
-    private final ObjectMapper objectMapper = new ObjectMapper();
 
     /** Single map: tick time -> combined snapshot of NIFTY + all 4 option prices at that time. */
     private final ConcurrentSkipListMap<LocalTime, TickSnapshot> snapshotsByTime = new ConcurrentSkipListMap<>();
     private final BlockingQueue<TickRecord> queue = new LinkedBlockingQueue<>(10_000);
-    private final ScheduledExecutorService exportExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
-        Thread t = new Thread(r, "tick-export-scheduler");
-        t.setDaemon(true);
-        return t;
-    });
+    /** Holds only snapshots that have every tracked label populated (see {@link TickSnapshot#isComplete()}). */
+    private final BlockingQueue<TickSnapshot> snapshotQueue = new LinkedBlockingQueue<>(10_000);
+    /**
+     * Global, process-wide reference to the most recently completed {@link TickSnapshot}
+     * (i.e. the last snapshot for which {@link TickSnapshot#isComplete()} was true).
+     * Any class can read the latest complete snapshot via {@link #getLatestCompleteSnapshot()}
+     * without needing a reference to this service instance.
+     */
+    private static volatile TickSnapshot latestCompleteSnapshot;
 
     private volatile Thread worker;
+    private volatile Thread snapshotWorker;
     private volatile boolean running;
 
     public TickPersistenceService(AngelOneProperties properties, DataSource dataSource, GreeksCacheService greeksCacheService) {
@@ -72,17 +72,31 @@ public class TickPersistenceService {
     @PostConstruct
     void start() {
         jdbcTemplate.execute("""
+                CREATE TABLE IF NOT EXISTS ticks (
+                    id BIGSERIAL PRIMARY KEY,
+                    label VARCHAR(32) NOT NULL,
+                    token VARCHAR(32),
+                    price DOUBLE PRECISION,
+                    exchange_timestamp_millis BIGINT,
+                    tick_date DATE NOT NULL,
+                    tick_time VARCHAR(16)
+                )
+                """);
+        jdbcTemplate.execute("""
                 CREATE TABLE IF NOT EXISTS tick_snapshot (
-                    tick_time VARCHAR(16) PRIMARY KEY,
-                    nifty DOUBLE,
-                    atm_ce DOUBLE,
-                    atm_ce_delta DOUBLE,
-                    atm_pe DOUBLE,
-                    atm_pe_delta DOUBLE,
-                    fixed_itm_ce DOUBLE,
-                    fixed_itm_ce_delta DOUBLE,
-                    fixed_itm_pe DOUBLE,
-                    fixed_itm_pe_delta DOUBLE
+                    tick_date DATE NOT NULL,
+                    tick_time VARCHAR(16) NOT NULL,
+                    nifty DOUBLE PRECISION,
+                    atm_ce DOUBLE PRECISION,
+                    atm_ce_delta DOUBLE PRECISION,
+                    atm_pe DOUBLE PRECISION,
+                    atm_pe_delta DOUBLE PRECISION,
+                    fixed_itm_ce DOUBLE PRECISION,
+                    fixed_itm_ce_delta DOUBLE PRECISION,
+                    fixed_itm_pe DOUBLE PRECISION,
+                    fixed_itm_pe_delta DOUBLE PRECISION,
+                    nifty_fut DOUBLE PRECISION,
+                    PRIMARY KEY (tick_date, tick_time)
                 )
                 """);
 
@@ -91,16 +105,14 @@ public class TickPersistenceService {
         worker.setDaemon(true);
         worker.start();
 
-        // Safety net: if the process is killed forcibly (e.g. taskkill, or Ctrl+C not
-        // reaching the JVM cleanly on Windows), @PreDestroy may never run. Periodically
-        // export so at most a few seconds of data are ever at risk of being lost.
-        exportExecutor.scheduleAtFixedRate(this::exportToJson, 30, 30, TimeUnit.SECONDS);
+        snapshotWorker = new Thread(this::drainSnapshotLoop, "tick-snapshot-persistence-writer");
+        snapshotWorker.setDaemon(true);
+        snapshotWorker.start();
     }
 
     @PreDestroy
     void stop() {
         running = false;
-        exportExecutor.shutdownNow();
         if (worker != null) {
             worker.interrupt();
             try {
@@ -109,10 +121,16 @@ public class TickPersistenceService {
                 Thread.currentThread().interrupt();
             }
         }
-        // Drain any ticks that arrived but hadn't been persisted yet, so the final
-        // export below reflects every tick received before shutdown.
+        if (snapshotWorker != null) {
+            snapshotWorker.interrupt();
+            try {
+                snapshotWorker.join(5_000);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        // Drain any ticks/snapshots that arrived but hadn't been persisted yet.
         drainRemainingSynchronously();
-        exportToJson();
     }
 
     private void drainRemainingSynchronously() {
@@ -124,18 +142,46 @@ public class TickPersistenceService {
                 log.warn("Failed to persist a tick during shutdown drain", ex);
             }
         }
+        TickSnapshot snapshot;
+        while ((snapshot = snapshotQueue.poll()) != null) {
+            try {
+                persistSnapshot(snapshot);
+            } catch (Exception ex) {
+                log.warn("Failed to persist a complete snapshot during shutdown drain", ex);
+            }
+        }
     }
 
     /** Merges this tick's price (plus cached Delta, for option labels) into the snapshot for its tick time,
-     * and enqueues it for H2 persistence. */
+     * and enqueues it for Postgres persistence. Once the snapshot for that tick time has every tracked label
+     * populated, the completed snapshot is also pushed onto {@link #snapshotQueue}. */
     public void offer(TickRecord tick) {
         LocalTime time = LocalTime.parse(tick.tickTime(), TICK_TIME_PARSER);
         Double delta = greeksCacheService.getDelta(tick.label());
-        snapshotsByTime.compute(time, (t, existing) ->
+        TickSnapshot updated = snapshotsByTime.compute(time, (t, existing) ->
                 (existing != null ? existing : TickSnapshot.empty(t)).with(tick.label(), tick.price(), delta));
         if (!queue.offer(tick)) {
             log.warn("Tick persistence queue is full; dropping tick for {}", tick.label());
         }
+        if (updated.isComplete() && !snapshotQueue.offer(updated)) {
+            log.warn("Complete snapshot queue is full; dropping complete snapshot for {}", tick.tickTime());
+        }
+        if (updated.isComplete()) {
+            latestCompleteSnapshot = updated;
+        }
+    }
+
+    /** Returns the most recently completed {@link TickSnapshot} (all tracked labels populated), or
+     * {@code null} if none has completed yet. Accessible statically so any class can read it without
+     * needing this service's instance. */
+    public static TickSnapshot getLatestCompleteSnapshot() {
+        return latestCompleteSnapshot;
+    }
+
+    /** Returns the queue of snapshots that had every tracked label (NIFTY, ATM CE/PE, FIXED ITM CE/PE,
+     * NIFTY FUT) populated at the moment they became complete. Consumers should poll/take from this queue. */
+    public BlockingQueue<TickSnapshot> getSnapshotQueue() {
+        return snapshotQueue;
     }
 
     /** Returns an immutable, chronologically-ordered snapshot of the whole map. */
@@ -152,73 +198,55 @@ public class TickPersistenceService {
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception ex) {
-                log.warn("Failed to persist a tick to H2", ex);
+                log.warn("Failed to persist a tick to Postgres", ex);
             }
         }
     }
 
-    private void persist(TickRecord tick) {
-        String column = switch (tick.label()) {
-            case "NIFTY" -> "nifty";
-            case "ATM CE" -> "atm_ce";
-            case "ATM PE" -> "atm_pe";
-            case "FIXED ITM CE" -> "fixed_itm_ce";
-            case "FIXED ITM PE" -> "fixed_itm_pe";
-            default -> null;
-        };
-        if (column == null) {
-            return;
-        }
-        // Single-consumer thread: safe to upsert-then-update-one-column without extra locking.
-        jdbcTemplate.update("MERGE INTO tick_snapshot (tick_time) KEY (tick_time) VALUES (?)", tick.tickTime());
-        jdbcTemplate.update("UPDATE tick_snapshot SET " + column + " = ? WHERE tick_time = ?",
-                tick.price(), tick.tickTime());
-
-        String deltaColumn = switch (tick.label()) {
-            case "ATM CE" -> "atm_ce_delta";
-            case "ATM PE" -> "atm_pe_delta";
-            case "FIXED ITM CE" -> "fixed_itm_ce_delta";
-            case "FIXED ITM PE" -> "fixed_itm_pe_delta";
-            default -> null;
-        };
-        if (deltaColumn != null) {
-            Double delta = greeksCacheService.getDelta(tick.label());
-            if (delta != null) {
-                jdbcTemplate.update("UPDATE tick_snapshot SET " + deltaColumn + " = ? WHERE tick_time = ?",
-                        delta, tick.tickTime());
-            }
-        }
-    }
-
-    /** Exports the full tick_snapshot table to a JSON file. */
-    private void exportToJson() {
-        try {
-            List<Map<String, Object>> rows = new ArrayList<>();
-            jdbcTemplate.query("SELECT * FROM tick_snapshot ORDER BY tick_time", rs -> {
-                var meta = rs.getMetaData();
-                Map<String, Object> row = new java.util.LinkedHashMap<>();
-                for (int i = 1; i <= meta.getColumnCount(); i++) {
-                    row.put(meta.getColumnLabel(i), rs.getObject(i));
-                }
-                rows.add(row);
-            });
-
-            Path path = Path.of(properties.getTickExportPath()).toAbsolutePath();
-            Files.createDirectories(path.getParent());
-            Path tmp = Files.createTempFile(path.getParent(), "ticks-export-", ".tmp");
+    private void drainSnapshotLoop() {
+        while (running) {
             try {
-                Files.writeString(tmp, objectMapper.writerWithDefaultPrettyPrinter()
-                        .writeValueAsString(Map.of("tickSnapshots", rows)));
-                Files.move(tmp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } finally {
-                Files.deleteIfExists(tmp);
+                TickSnapshot snapshot = snapshotQueue.take();
+                persistSnapshot(snapshot);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception ex) {
+                log.warn("Failed to persist a complete snapshot to Postgres", ex);
             }
-            log.info("Exported {} tick snapshot rows to {}", rows.size(), path);
-        } catch (Exception ex) {
-            log.error("Failed to export H2 tick data to JSON on shutdown", ex);
         }
+    }
+
+    /** Appends the raw tick as a new row in the {@code ticks} table (one row per tick received), dated today. */
+    private void persist(TickRecord tick) {
+        jdbcTemplate.update(
+                "INSERT INTO ticks (label, token, price, exchange_timestamp_millis, tick_date, tick_time) VALUES (?, ?, ?, ?, ?, ?)",
+                tick.label(), tick.token(), tick.price(), tick.exchangeTimestampMillis(), LocalDate.now(), tick.tickTime());
+    }
+
+    /** Upserts a completed snapshot (all tracked labels populated) as one row in the {@code tick_snapshot} table,
+     * keyed by today's date + tick time so ticks from different trading days never collide. */
+    private void persistSnapshot(TickSnapshot snapshot) {
+        jdbcTemplate.update("""
+                INSERT INTO tick_snapshot (
+                    tick_date, tick_time, nifty, atm_ce, atm_ce_delta, atm_pe, atm_pe_delta,
+                    fixed_itm_ce, fixed_itm_ce_delta, fixed_itm_pe, fixed_itm_pe_delta, nifty_fut
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (tick_date, tick_time) DO UPDATE SET
+                    nifty = EXCLUDED.nifty,
+                    atm_ce = EXCLUDED.atm_ce,
+                    atm_ce_delta = EXCLUDED.atm_ce_delta,
+                    atm_pe = EXCLUDED.atm_pe,
+                    atm_pe_delta = EXCLUDED.atm_pe_delta,
+                    fixed_itm_ce = EXCLUDED.fixed_itm_ce,
+                    fixed_itm_ce_delta = EXCLUDED.fixed_itm_ce_delta,
+                    fixed_itm_pe = EXCLUDED.fixed_itm_pe,
+                    fixed_itm_pe_delta = EXCLUDED.fixed_itm_pe_delta,
+                    nifty_fut = EXCLUDED.nifty_fut
+                """,
+                LocalDate.now(), snapshot.tickTime().toString(), snapshot.nifty(),
+                snapshot.atmCe(), snapshot.atmCeDelta(), snapshot.atmPe(), snapshot.atmPeDelta(),
+                snapshot.fixedItmCe(), snapshot.fixedItmCeDelta(), snapshot.fixedItmPe(), snapshot.fixedItmPeDelta(),
+                snapshot.niftyFut());
     }
 }
-
-
-

@@ -27,7 +27,8 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Downloads and parses the Angel One Scrip Master (instrument dump) and
- * extracts NIFTY index option (OPTIDX) contracts traded on the NFO segment.
+ * extracts NIFTY index option (OPTIDX) and future (FUTIDX) contracts traded
+ * on the NFO segment.
  */
 @Service
 public class ScripMasterService {
@@ -50,6 +51,9 @@ public class ScripMasterService {
     private volatile List<OptionContract> cachedNiftyOptions;
     private volatile long cachedAtMillis;
     private static final long CACHE_TTL_MILLIS = 60L * 60 * 1000; // refresh at most hourly
+
+    private volatile List<OptionContract> cachedNiftyFutures;
+    private volatile long cachedFuturesAtMillis;
 
     public ScripMasterService(AngelOneProperties properties) {
         this.properties = properties;
@@ -81,6 +85,20 @@ public class ScripMasterService {
         return new NiftyExpiryContracts(nearestExpiry, contracts);
     }
 
+    /**
+     * Returns the nearest (soonest, non-expired) NIFTY index future (FUTIDX) contract
+     * from the Scrip Master.
+     */
+    public OptionContract getNearestNiftyFuture() {
+        List<OptionContract> futures = getNiftyFutures();
+
+        LocalDate today = LocalDate.now();
+        return futures.stream()
+                .filter(f -> !f.expiry().isBefore(today))
+                .min((a, b) -> a.expiry().compareTo(b.expiry()))
+                .orElseThrow(() -> new IllegalStateException("No upcoming NIFTY future expiry found in Scrip Master"));
+    }
+
     /** Returns all NIFTY OPTIDX contracts from the Scrip Master, downloading/parsing if not already cached. */
     public List<OptionContract> getNiftyOptions() {
         if (cachedNiftyOptions != null && (System.currentTimeMillis() - cachedAtMillis) < CACHE_TTL_MILLIS) {
@@ -94,6 +112,24 @@ public class ScripMasterService {
             cachedNiftyOptions = downloadAndParse();
             cachedAtMillis = System.currentTimeMillis();
             return cachedNiftyOptions;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Returns all NIFTY FUTIDX contracts from the Scrip Master, downloading/parsing if not already cached. */
+    public List<OptionContract> getNiftyFutures() {
+        if (cachedNiftyFutures != null && (System.currentTimeMillis() - cachedFuturesAtMillis) < CACHE_TTL_MILLIS) {
+            return cachedNiftyFutures;
+        }
+        lock.lock();
+        try {
+            if (cachedNiftyFutures != null && (System.currentTimeMillis() - cachedFuturesAtMillis) < CACHE_TTL_MILLIS) {
+                return cachedNiftyFutures;
+            }
+            cachedNiftyFutures = downloadAndParseFutures();
+            cachedFuturesAtMillis = System.currentTimeMillis();
+            return cachedNiftyFutures;
         } finally {
             lock.unlock();
         }
@@ -175,6 +211,72 @@ public class ScripMasterService {
 
         log.info("Parsed {} NIFTY OPTIDX contracts from Scrip Master", options.size());
         return options;
+    }
+
+    private List<OptionContract> downloadAndParseFutures() {
+        String body = readFromCacheOrDownload();
+
+        JsonNode root;
+        try {
+            root = objectMapper.readTree(body);
+        } catch (Exception ex) {
+            throw new IllegalStateException("Failed to parse Angel One Scrip Master: " + ex.getMessage(), ex);
+        }
+
+        if (!root.isArray()) {
+            throw new IllegalStateException("Unexpected Scrip Master format: expected a JSON array");
+        }
+
+        List<OptionContract> futures = new ArrayList<>();
+        for (JsonNode node : root) {
+            String exchSeg = node.path("exch_seg").asText("");
+            String instrumentType = node.path("instrumenttype").asText("");
+            String name = node.path("name").asText("");
+
+            if (!"NFO".equalsIgnoreCase(exchSeg) || !"FUTIDX".equalsIgnoreCase(instrumentType) || !"NIFTY".equalsIgnoreCase(name)) {
+                continue;
+            }
+
+            String symbol = node.path("symbol").asText("");
+            String expiryRaw = node.path("expiry").asText("");
+            if (expiryRaw.isBlank()) {
+                continue;
+            }
+
+            LocalDate expiry;
+            try {
+                expiry = LocalDate.parse(expiryRaw, EXPIRY_FORMAT);
+            } catch (Exception ex) {
+                log.warn("Skipping future {} with unparsable expiry '{}'", symbol, expiryRaw);
+                continue;
+            }
+
+            int lotSize;
+            try {
+                lotSize = (int) Double.parseDouble(node.path("lotsize").asText("0"));
+            } catch (NumberFormatException ex) {
+                lotSize = 0;
+            }
+
+            futures.add(new OptionContract(
+                    node.path("token").asText(""),
+                    symbol,
+                    name,
+                    exchSeg,
+                    instrumentType,
+                    expiry,
+                    0.0,
+                    "FUT",
+                    lotSize
+            ));
+        }
+
+        if (futures.isEmpty()) {
+            throw new IllegalStateException("No NIFTY FUTIDX contracts found in Scrip Master");
+        }
+
+        log.info("Parsed {} NIFTY FUTIDX contracts from Scrip Master", futures.size());
+        return futures;
     }
 
     /**
