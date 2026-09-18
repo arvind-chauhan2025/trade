@@ -8,10 +8,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
@@ -33,11 +37,13 @@ public class ScripMasterService {
             .parseCaseInsensitive()
             .appendPattern("ddMMMyyyy")
             .toFormatter(Locale.ENGLISH);
+    private static final DateTimeFormatter CACHE_FILE_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+    private static final Path CACHE_DIR = Path.of("data");
 
     private final AngelOneProperties properties;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final HttpClient httpClient = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(30))
+            .connectTimeout(Duration.ofMinutes(8))
             .build();
     private final ReentrantLock lock = new ReentrantLock();
 
@@ -94,23 +100,13 @@ public class ScripMasterService {
     }
 
     private List<OptionContract> downloadAndParse() {
-        log.info("Downloading Angel One Scrip Master from {}", properties.getScripMasterUrl());
-
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(properties.getScripMasterUrl()))
-                .timeout(Duration.ofSeconds(60))
-                .GET()
-                .build();
+        String body = readFromCacheOrDownload();
 
         JsonNode root;
         try {
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() != 200) {
-                throw new IllegalStateException("Scrip Master download failed with HTTP " + response.statusCode());
-            }
-            root = objectMapper.readTree(response.body());
+            root = objectMapper.readTree(body);
         } catch (Exception ex) {
-            throw new IllegalStateException("Failed to download/parse Angel One Scrip Master: " + ex.getMessage(), ex);
+            throw new IllegalStateException("Failed to parse Angel One Scrip Master: " + ex.getMessage(), ex);
         }
 
         if (!root.isArray()) {
@@ -179,6 +175,55 @@ public class ScripMasterService {
 
         log.info("Parsed {} NIFTY OPTIDX contracts from Scrip Master", options.size());
         return options;
+    }
+
+    /**
+     * Returns today's cached Scrip Master response body from the local data folder,
+     * downloading and persisting it first if no cache file exists yet for today.
+     */
+    private String readFromCacheOrDownload() {
+        Path cacheFile = CACHE_DIR.resolve("scrip-master-" + LocalDate.now().format(CACHE_FILE_DATE_FORMAT) + ".json");
+
+        if (Files.exists(cacheFile)) {
+            try {
+                log.info("Loading Scrip Master from local cache: {}", cacheFile.toAbsolutePath());
+                return Files.readString(cacheFile, StandardCharsets.UTF_8);
+            } catch (IOException ex) {
+                log.warn("Failed to read Scrip Master cache file {}, re-downloading: {}", cacheFile, ex.getMessage());
+            }
+        }
+
+        String body = download();
+        try {
+            Files.createDirectories(CACHE_DIR);
+            Files.writeString(cacheFile, body, StandardCharsets.UTF_8);
+            log.info("Cached Scrip Master response to {}", cacheFile.toAbsolutePath());
+        } catch (IOException ex) {
+            log.warn("Failed to write Scrip Master cache file {}: {}", cacheFile, ex.getMessage());
+        }
+        return body;
+    }
+
+    private String download() {
+        log.info("Downloading Angel One Scrip Master from {}", properties.getScripMasterUrl());
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(properties.getScripMasterUrl()))
+                .timeout(Duration.ofMinutes(8))
+                .GET()
+                .build();
+
+        try {
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() != 200) {
+                throw new IllegalStateException("Scrip Master download failed with HTTP " + response.statusCode());
+            }
+            return response.body();
+        } catch (IllegalStateException ex) {
+            throw ex;
+        } catch (Exception ex) {
+            throw new IllegalStateException("Failed to download Angel One Scrip Master: " + ex.getMessage(), ex);
+        }
     }
 }
 
