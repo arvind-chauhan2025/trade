@@ -63,8 +63,16 @@ public class PremiumReferenceService {
      * </ul>
      * No-op while it's still before 9:15 AM, or if the snapshot isn't fully populated yet. */
     public void captureIfNeeded(TickSnapshot snapshot) {
+        captureIfNeeded(snapshot, false);
+    }
+
+    /** Same as {@link #captureIfNeeded(TickSnapshot)}, but when {@code ignoreMarketOpenGate} is
+     * {@code true}, skips the "only at/after 9:15 AM" check. Intended only for mock/testing snapshots
+     * (e.g. {@code snapshot.mock.enabled=true}) generated before market open, so the reference can still
+     * be captured and expected/divergence fields populated while testing outside trading hours. */
+    public void captureIfNeeded(TickSnapshot snapshot, boolean ignoreMarketOpenGate) {
         LocalDate today = LocalDate.now();
-        if (snapshot.tickTime().isBefore(MARKET_OPEN)) {
+        if (!ignoreMarketOpenGate && snapshot.tickTime().isBefore(MARKET_OPEN)) {
             return;
         }
         if (snapshot.nifty() == null || snapshot.atmCe() == null || snapshot.atmPe() == null

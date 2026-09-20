@@ -1,5 +1,6 @@
 package com.example.demo.service;
 
+import com.example.demo.config.MockGreeksProperties;
 import com.example.demo.dto.OptionContract;
 import com.example.demo.dto.OptionGreek;
 import org.slf4j.Logger;
@@ -18,6 +19,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * labels used elsewhere in the pipeline. This makes Delta/Gamma/Theta available to the existing
  * in-memory tick calculations without requiring per-tick Greeks calls (Angel One's Greeks API is a
  * REST snapshot, not a streamed value).
+ * <p>
+ * When {@link MockGreeksProperties#isEnabled()} is {@code true} (e.g. {@code greeks.mock.enabled=true}),
+ * Greeks are synthesized locally from the configured mock values instead of being fetched from Angel
+ * One, so the pipeline can be exercised outside market hours when the real Greeks API has no data.
  */
 @Service
 public class GreeksCacheService {
@@ -25,17 +30,25 @@ public class GreeksCacheService {
     private static final Logger log = LoggerFactory.getLogger(GreeksCacheService.class);
 
     private final AngelOneOptionGreeksService greeksService;
+    private final MockGreeksProperties mockGreeksProperties;
     private final ConcurrentHashMap<String, OptionGreek> greeksByLabel = new ConcurrentHashMap<>();
 
-    public GreeksCacheService(AngelOneOptionGreeksService greeksService) {
+    public GreeksCacheService(AngelOneOptionGreeksService greeksService, MockGreeksProperties mockGreeksProperties) {
         this.greeksService = greeksService;
+        this.mockGreeksProperties = mockGreeksProperties;
     }
 
     /**
-     * Fetches Greeks for {@code expiry} and updates the cached Greek set for each
-     * labeled contract, matching by exact strike + option type.
+     * Updates the cached Greek set for each labeled contract for {@code expiry}. If
+     * {@code greeks.mock.enabled=true}, synthesizes Greeks locally from the configured mock values;
+     * otherwise fetches real Greeks from Angel One and matches by exact strike + option type.
      */
     public void refresh(LocalDate expiry, Map<String, OptionContract> trackedContracts) {
+        if (mockGreeksProperties.isEnabled()) {
+            refreshWithMockData(expiry, trackedContracts);
+            return;
+        }
+
         log.info("Refreshing Greeks for expiry={}", expiry);
         List<OptionGreek> greeks = greeksService.getGreeks(expiry);
 
@@ -50,6 +63,24 @@ public class GreeksCacheService {
                         },
                         () -> log.warn("No Greeks entry found for {} strike={} expiry={}", label, contract.strike(), expiry)
                 ));
+    }
+
+    /** Synthesizes an {@link OptionGreek} per tracked label from {@link MockGreeksProperties}, using each
+     * contract's real strike/optionType but configured mock Delta/Gamma/Theta/Vega/IV. Delta's sign
+     * follows the option type (positive for CE, negative for PE), matching real-world convention. */
+    private void refreshWithMockData(LocalDate expiry, Map<String, OptionContract> trackedContracts) {
+        log.info("greeks.mock.enabled=true; synthesizing mock Greeks for expiry={} instead of calling Angel One", expiry);
+        trackedContracts.forEach((label, contract) -> {
+            boolean isCall = contract.optionType().equalsIgnoreCase("CE");
+            double delta = isCall ? Math.abs(mockGreeksProperties.getDelta()) : -Math.abs(mockGreeksProperties.getDelta());
+            OptionGreek mock = new OptionGreek(
+                    contract.strike(), contract.optionType(),
+                    delta, mockGreeksProperties.getGamma(), mockGreeksProperties.getTheta(),
+                    mockGreeksProperties.getVega(), mockGreeksProperties.getImpliedVolatility());
+            greeksByLabel.put(label, mock);
+            log.info("{} (mock) Delta={} Gamma={} Theta={} (strike={}, expiry={})",
+                    label, mock.delta(), mock.gamma(), mock.theta(), contract.strike(), expiry);
+        });
     }
 
     /** Returns the cached Delta for a label (ATM CE, ATM PE, FIXED ITM CE, FIXED ITM PE), or null if unavailable. */
