@@ -98,7 +98,8 @@ public class TickSnapshotBroadcastService {
 
         if (snapshot.nifty() != null) {
             niftyCandleService.onTick(LocalDate.now(), snapshot.tickTime(), snapshot.nifty())
-                    .ifPresent(completedCandle -> supportResistanceService.recalculate(completedCandle.tradeDate()));
+                    .ifPresent(completedCandle ->
+                            supportResistanceService.recalculate(completedCandle.tradeDate(), snapshot.nifty()));
         }
 
         Map<String, Object> enriched = premiumReferenceService.enrich(snapshot);

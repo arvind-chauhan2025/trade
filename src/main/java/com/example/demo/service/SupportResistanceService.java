@@ -14,6 +14,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -42,14 +43,17 @@ public class SupportResistanceService {
     private final NiftyCandleService niftyCandleService;
     private final SupportResistanceProperties properties;
     private final JdbcTemplate jdbcTemplate;
+    private final NiftySpotPriceService niftySpotPriceService;
 
     private volatile List<SrZone> currentZones = List.of();
 
     public SupportResistanceService(NiftyCandleService niftyCandleService, SupportResistanceProperties properties,
-                                     DataSource dataSource) {
+                                     DataSource dataSource, NiftySpotPriceService niftySpotPriceService) {
+
         this.niftyCandleService = niftyCandleService;
         this.properties = properties;
         this.jdbcTemplate = new JdbcTemplate(dataSource);
+        this.niftySpotPriceService = niftySpotPriceService;
     }
 
     @PostConstruct
@@ -67,19 +71,52 @@ public class SupportResistanceService {
                     PRIMARY KEY (trade_date, zone_type, zone_index)
                 )
                 """);
-        // Restart recovery: recalculate from whatever candles are already persisted for today.
-        recalculate(LocalDate.now());
+        // Restart recovery: recalculate from whatever candles are already persisted for today, using the
+        // last persisted candle's close as the current spot (best available reference until the next tick).
+        List<NiftyCandle> todaysCandles = niftyCandleService.getCandles(LocalDate.now());
+        double lastKnownSpot = todaysCandles.isEmpty() ? 0.0 : todaysCandles.get(todaysCandles.size() - 1).close();
+        recalculate(LocalDate.now(), lastKnownSpot);
     }
 
-    /** Recalculates S/R zones from all of {@code tradeDate}'s completed 5-minute candles, replaces that
-     * day's persisted zones in {@code nifty_sr_zone}, and updates the in-memory current zones. Never
-     * touches the {@code nifty_candle_5m} candle history. */
-    public synchronized void recalculate(LocalDate tradeDate) {
+    /** Recalculates S/R zones from all of {@code tradeDate}'s completed 5-minute candles, keeps only the
+     * nearest 2 Resistance zones above {@code currentSpot} and nearest 2 Support zones below it (an
+     * "active" S/R zone must sit on the correct side of the current price to be treated as such), replaces
+     * that day's persisted zones in {@code nifty_sr_zone} with only those active zones, and updates the
+     * in-memory current zones. Never touches the {@code nifty_candle_5m} candle history. */
+    public synchronized void recalculate(LocalDate tradeDate, double currentSpot) {
         List<NiftyCandle> candles = niftyCandleService.getCandles(tradeDate);
-        List<SrZone> zones = calculateZones(candles);
-        persistZones(tradeDate, zones);
-        currentZones = zones;
-        log.info("Recalculated S/R for {}: {} zone(s) from {} candle(s)", tradeDate, zones.size(), candles.size());
+        List<SrZone> allZones = calculateZones(candles);
+        List<SrZone> activeZones = selectActiveZones(allZones, currentSpot);
+        persistZones(tradeDate, activeZones);
+        currentZones = activeZones;
+        log.info("Recalculated S/R for {} (spot={}): {} active zone(s) of {} total from {} candle(s)",
+                tradeDate, currentSpot, activeZones.size(), allZones.size(), candles.size());
+    }
+
+    /** Keeps only Resistance zones whose level is above {@code currentSpot} (nearest 2) and Support zones
+     * whose level is below {@code currentSpot} (nearest 2). A zone on the wrong side of spot (e.g. a
+     * "resistance" that price has already broken above) is dropped rather than re-labelled. */
+    private List<SrZone> selectActiveZones(List<SrZone> zones, double currentSpot) {
+        List<SrZone> resistances = zones.stream()
+                .filter(zone -> SrZone.RESISTANCE.equals(zone.type()) && zone.level() > currentSpot)
+                .sorted(Comparator.comparingDouble(SrZone::level))
+                .limit(2)
+                .toList();
+        List<SrZone> supports = zones.stream()
+                .filter(zone -> SrZone.SUPPORT.equals(zone.type()) && zone.level() < currentSpot)
+                .sorted(Comparator.comparingDouble(SrZone::level).reversed())
+                .limit(2)
+                .toList();
+        List<SrZone> active = new ArrayList<>(resistances);
+        active.addAll(supports);
+        return active;
+    }
+
+    /** Dynamically computes the active Support/Resistance zones (nearest 2 above/below {@code currentSpot})
+     * for an arbitrary set of candles (e.g. a multi-day range requested via the API), without touching
+     * persisted state or the in-memory current-day zones. */
+    public List<SrZone> calculateZonesFor(List<NiftyCandle> candles, double currentSpot) {
+        return selectActiveZones(calculateZones(candles), currentSpot);
     }
 
     /** Detects swing highs/lows across {@code candles} and clusters them into Support/Resistance zones. */
