@@ -1,14 +1,20 @@
 package com.example.demo.service;
 
 import com.example.demo.dto.TickSnapshot;
+import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
+import javax.sql.DataSource;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -37,6 +43,13 @@ import java.util.Map;
  * that curvature. Theta's sign is preserved as returned by the broker (typically negative), so it
  * naturally decays the expected premium as elapsed time grows. No expected value/divergence is computed
  * until the relevant reference has been captured for the day.
+ * <p>
+ * {@code TradingApplication} also re-selects the actual ATM/FIXED ITM CE/PE <b>strikes</b> every 30
+ * minutes as spot moves (held fixed within each window) and calls {@link #resetRollingReference()}
+ * whenever a leg's strike changes. Each reference point also records the strike it was captured at, so
+ * {@link #applyReference} can detect and suppress expected/divergence output for the brief gap between a
+ * strike change and the next reference recapture, rather than comparing a captured strike (e.g. 23400)
+ * against a now-current different strike (e.g. 23550).
  */
 @Service
 public class PremiumReferenceService {
@@ -125,11 +138,27 @@ public class PremiumReferenceService {
         return new ReferenceData(
                 snapshot.tickTime(),
                 snapshot.nifty(),
-                snapshot.atmCe(), greeksCacheService.getDelta("ATM CE"), greeksCacheService.getGamma("ATM CE"), greeksCacheService.getTheta("ATM CE"),
-                snapshot.atmPe(), greeksCacheService.getDelta("ATM PE"), greeksCacheService.getGamma("ATM PE"), greeksCacheService.getTheta("ATM PE"),
-                snapshot.fixedItmCe(), greeksCacheService.getDelta("FIXED ITM CE"), greeksCacheService.getGamma("FIXED ITM CE"), greeksCacheService.getTheta("FIXED ITM CE"),
-                snapshot.fixedItmPe(), greeksCacheService.getDelta("FIXED ITM PE"), greeksCacheService.getGamma("FIXED ITM PE"), greeksCacheService.getTheta("FIXED ITM PE")
+                snapshot.atmCe(), snapshot.atmCeStrike(), greeksCacheService.getDelta("ATM CE"), greeksCacheService.getGamma("ATM CE"), greeksCacheService.getTheta("ATM CE"),
+                snapshot.atmPe(), snapshot.atmPeStrike(), greeksCacheService.getDelta("ATM PE"), greeksCacheService.getGamma("ATM PE"), greeksCacheService.getTheta("ATM PE"),
+                snapshot.fixedItmCe(), snapshot.fixedItmCeStrike(), greeksCacheService.getDelta("FIXED ITM CE"), greeksCacheService.getGamma("FIXED ITM CE"), greeksCacheService.getTheta("FIXED ITM CE"),
+                snapshot.fixedItmPe(), snapshot.fixedItmPeStrike(), greeksCacheService.getDelta("FIXED ITM PE"), greeksCacheService.getGamma("FIXED ITM PE"), greeksCacheService.getTheta("FIXED ITM PE")
         );
+    }
+
+    /**
+     * Invalidates the rolling reference immediately, without waiting for the 30-minute interval to
+     * elapse. Called by {@code TradingApplication} whenever the 30-minute rolling ATM/ITM re-selection
+     * swaps in a different strike for any leg (e.g. ATM was 23400, spot moved and the new window's ATM is
+     * 23550): the old reference's premium belongs to a now-abandoned strike, so comparing the new
+     * strike's live premium against it would be meaningless. Clearing it here means {@link #applyReference}
+     * reports {@code null} expected/divergence values (rather than a misleading number) until
+     * {@link #captureIfNeeded} recaptures a fresh reference — at the new strikes — from the very next
+     * complete snapshot.
+     */
+    public void resetRollingReference() {
+        rollingReference = null;
+        rollingReferenceDate = null;
+        log.info("Rolling reference invalidated (ATM/ITM re-selection changed strikes); will recapture from next complete snapshot");
     }
 
     /** Returns a flattened view of {@code snapshot} (every TickSnapshot field) plus, once each reference
@@ -176,19 +205,31 @@ public class PremiumReferenceService {
         double elapsedDays = Duration.between(ref.time(), snapshot.tickTime()).toMillis() / 86_400_000.0;
         result.put("spotChange" + suffix, spotChange);
 
-        putSide(result, "atmCe", suffix, snapshot.atmCe(), ref.atmCe(), ref.atmCeDelta(), ref.atmCeGamma(), ref.atmCeTheta(), spotChange, elapsedDays);
-        putSide(result, "atmPe", suffix, snapshot.atmPe(), ref.atmPe(), ref.atmPeDelta(), ref.atmPeGamma(), ref.atmPeTheta(), spotChange, elapsedDays);
-        putSide(result, "fixedItmCe", suffix, snapshot.fixedItmCe(), ref.fixedItmCe(), ref.fixedItmCeDelta(), ref.fixedItmCeGamma(), ref.fixedItmCeTheta(), spotChange, elapsedDays);
-        putSide(result, "fixedItmPe", suffix, snapshot.fixedItmPe(), ref.fixedItmPe(), ref.fixedItmPeDelta(), ref.fixedItmPeGamma(), ref.fixedItmPeTheta(), spotChange, elapsedDays);
+        putSide(result, "atmCe", suffix, snapshot.atmCe(), snapshot.atmCeStrike(), ref.atmCe(), ref.atmCeStrike(), ref.atmCeDelta(), ref.atmCeGamma(), ref.atmCeTheta(), spotChange, elapsedDays);
+        putSide(result, "atmPe", suffix, snapshot.atmPe(), snapshot.atmPeStrike(), ref.atmPe(), ref.atmPeStrike(), ref.atmPeDelta(), ref.atmPeGamma(), ref.atmPeTheta(), spotChange, elapsedDays);
+        putSide(result, "fixedItmCe", suffix, snapshot.fixedItmCe(), snapshot.fixedItmCeStrike(), ref.fixedItmCe(), ref.fixedItmCeStrike(), ref.fixedItmCeDelta(), ref.fixedItmCeGamma(), ref.fixedItmCeTheta(), spotChange, elapsedDays);
+        putSide(result, "fixedItmPe", suffix, snapshot.fixedItmPe(), snapshot.fixedItmPeStrike(), ref.fixedItmPe(), ref.fixedItmPeStrike(), ref.fixedItmPeDelta(), ref.fixedItmPeGamma(), ref.fixedItmPeTheta(), spotChange, elapsedDays);
     }
 
-    private void putSide(Map<String, Object> result, String prefix, String suffix, Double actual, Double referencePremium,
+    private void putSide(Map<String, Object> result, String prefix, String suffix, Double actual, Double actualStrike,
+                          Double referencePremium, Double referenceStrike,
                           Double delta, Double gamma, Double theta, double spotChange, double elapsedDays) {
         result.put(prefix + "Gamma" + suffix, gamma);
         result.put(prefix + "Theta" + suffix, theta);
         if (actual == null || referencePremium == null || delta == null || gamma == null || theta == null) {
             result.put(prefix + "Expected" + suffix, null);
             result.put(prefix + "Divergence" + suffix, null);
+            return;
+        }
+        // Guards against comparing across a strike change (e.g. rolling ATM re-selection swapped 23400
+        // for 23550 mid-window, but this reference/snapshot pair hasn't been refreshed for it yet):
+        // the reference's premium belongs to a different instrument than the current tick, so the
+        // Taylor-expansion math below would be comparing unrelated strikes. Suppress rather than mislead.
+        if (actualStrike == null || referenceStrike == null || Double.compare(actualStrike, referenceStrike) != 0) {
+            result.put(prefix + "Expected" + suffix, null);
+            result.put(prefix + "Divergence" + suffix, null);
+            log.debug("{}{}: skipping expected/divergence, strike mismatch (referenceStrike={}, actualStrike={})",
+                    prefix, suffix, referenceStrike, actualStrike);
             return;
         }
         double expected = referencePremium
@@ -213,10 +254,10 @@ public class PremiumReferenceService {
     private record ReferenceData(
             LocalTime time,
             double nifty,
-            double atmCe, Double atmCeDelta, Double atmCeGamma, Double atmCeTheta,
-            double atmPe, Double atmPeDelta, Double atmPeGamma, Double atmPeTheta,
-            double fixedItmCe, Double fixedItmCeDelta, Double fixedItmCeGamma, Double fixedItmCeTheta,
-            double fixedItmPe, Double fixedItmPeDelta, Double fixedItmPeGamma, Double fixedItmPeTheta
+            double atmCe, Double atmCeStrike, Double atmCeDelta, Double atmCeGamma, Double atmCeTheta,
+            double atmPe, Double atmPeStrike, Double atmPeDelta, Double atmPeGamma, Double atmPeTheta,
+            double fixedItmCe, Double fixedItmCeStrike, Double fixedItmCeDelta, Double fixedItmCeGamma, Double fixedItmCeTheta,
+            double fixedItmPe, Double fixedItmPeStrike, Double fixedItmPeDelta, Double fixedItmPeGamma, Double fixedItmPeTheta
     ) {
     }
 }

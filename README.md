@@ -1,55 +1,56 @@
 # NIFTY Live Options Trading Analytics Backend — Step 1
 
 A Spring Boot backend that connects to **Angel One SmartAPI** and streams
-NIFTY spot, startup ATM CE/PE, and a fixed weekly ITM CE/PE pair over SmartStream.
+NIFTY spot, and rolling ATM CE/PE + ITM CE/PE pairs over SmartStream.
 All option tokens, strikes and expiries are discovered from the Scrip Master.
 
-## Fixed weekly ITM CE/PE and separate ATM CE/PE
+## Rolling ATM CE/PE and ITM CE/PE (30-minute window)
 
 The original CE-only walkthrough below describes the foundation; the current
 pipeline subscribes to all four option roles plus NIFTY spot.
 
-- On first startup, round spot to `round(spot / strikeStep) * strikeStep`.
-- Fixed ITM CE strike = rounded ATM minus `itmDepth * strikeStep`.
-- Fixed ITM PE strike = rounded ATM plus `itmDepth * strikeStep`.
-- Example: initial spot 25412.30, step 50, depth 1: ATM 25400,
-  fixed ITM CE 25350 and fixed ITM PE 25450. These are illustrative,
+- At market open (9:15 AM IST) and again every `angelone.atm-itm-reselect-minutes`
+  (default 30) minutes thereafter, round the current live spot to
+  `round(spot / strikeStep) * strikeStep`.
+- ITM CE strike = rounded ATM minus `itmDepth * strikeStep`.
+- ITM PE strike = rounded ATM plus `itmDepth * strikeStep`.
+- Example: spot 25412.30, step 50, depth 1: ATM 25400,
+  ITM CE 25350 and ITM PE 25450. These are illustrative,
   not hard-coded selections. Exact ITM strikes must exist in the master.
-- `FixedItmSelectionService` saves the two identities atomically to
-  `data/fixed-itm.json`. Restarting with a different spot restores the same
-  unexpired pair and validates token, symbol, strike and expiry against the master.
-- ATM CE/PE are independently selected from current startup spot for that same
-  expiry using the existing nearest-available-strike selector. They are **not
-  continuously recentered on incoming ticks**.
-- The fixed pair is ITM at initial selection, not necessarily later. It is never
-  moved merely because spot changes. Overlapping ATM/fixed tokens are subscribed
-  once, but ticks log both labels.
+- Both ATM CE/PE (`NiftyOptionSelector`) and ITM CE/PE (`FixedItmSelectionService`)
+  are recomputed fresh from the live spot every window — **never** pinned across
+  restarts or across days. Each trading day therefore starts from that morning's
+  own spot, and strikes are held fixed for the rest of each 30-minute window,
+  only changing at the window boundary (`TradingApplication
+  .reselectAtmItmIfWindowElapsed()`), not on every tick.
+- When a window's re-selection changes any leg's strike, the SmartStream
+  subscription is atomically swapped to the new token(s)
+  (`AngelOneMarketDataService.updateSelection`), Greeks are refreshed for the
+  new contracts, and `PremiumReferenceService`'s 30-minute rolling reference is
+  invalidated so a stale strike's captured premium (e.g. ATM 23400) is never
+  compared against a different, now-current strike's premium (e.g. ATM 23550);
+  `PremiumReferenceService` also records the strike each reference was captured
+  at and suppresses `xExpected30m`/`xDivergence30m` output if it ever mismatches
+  the current tick's strike.
 - Expiry is the nearest listed non-expired NIFTY expiry (including monthly-expiry
-  weeks). Dates use Asia/Kolkata. Keep the selection through expiry day;
-  the first startup on a later day creates a new pair. There is **no automatic
-  in-process expiry rollover**: restart after expiry to select the next pair.
+  weeks). Dates use Asia/Kolkata. There is **no automatic in-process expiry
+  rollover** mid-day beyond the next re-selection window naturally picking up
+  the next expiry once the current one has passed.
 
 Configuration:
 
 ```properties
 angelone.strike-step=50
 angelone.itm-depth=${ANGELONE_ITM_DEPTH:1}
-angelone.fixed-itm-state-path=${ANGELONE_FIXED_ITM_STATE_PATH:data/fixed-itm.json}
+angelone.atm-itm-reselect-minutes=${ANGELONE_ATM_ITM_RESELECT_MINUTES:30}
 ```
 
-Depth 2 means 100 points on either side of the initial rounded ATM with step 50.
-Depth/step changes do not replace a saved unexpired ITM pair. Keep the state file
-across restarts; for deployment use a durable absolute path. Deleting it resets
-the weekly selection. This local store supports **one application instance per
-state file**, not concurrent writers. It stores instrument metadata only, no
-credentials. Missing saved contracts, corrupt state or storage errors stop
-pipeline initialization rather than silently replacing the pair.
+Depth 2 means 100 points on either side of the rounded ATM with step 50.
 
-Startup logs show each fixed symbol, token, strike and expiry. Tick labels are
-`NIFTY`, `ATM CE`, `ATM PE`, `FIXED ITM CE`, and `FIXED ITM PE`, each followed by
-price and exchange time. To verify persistence, record fixed identities, restart
-with the same state path and confirm both identities remain unchanged. Offline
-selection tests are available with:
+Startup and rolling-reselection logs show each symbol, token, strike and expiry
+(and, on a re-selection, the old→new strike for every leg that changed). Tick
+labels are `NIFTY`, `ATM CE`, `ATM PE`, `FIXED ITM CE`, and `FIXED ITM PE`, each
+followed by price and exchange time. Offline selection tests are available with:
 
 ```powershell
 .\gradlew.bat test --tests "com.example.demo.service.FixedItmSelectionServiceTest"

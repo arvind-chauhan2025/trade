@@ -53,8 +53,19 @@ public class AngelOneProperties {
     private int strikeStep = 50;
 
     private int itmDepth = 1;
-    private String fixedItmStatePath = "data/fixed-itm.json";
     private int tickHistorySize = 500;
+    /** How often (in minutes) ATM CE/PE and FIXED ITM CE/PE are re-selected from the live spot price
+     * during market hours; strikes are held fixed for the rest of each window. Kept in sync with
+     * {@code PremiumReferenceService}'s 30-minute rolling reference by default. */
+    private int atmItmReselectMinutes = 30;
+
+    public int getAtmItmReselectMinutes() {
+        return atmItmReselectMinutes;
+    }
+
+    public void setAtmItmReselectMinutes(int atmItmReselectMinutes) {
+        this.atmItmReselectMinutes = atmItmReselectMinutes;
+    }
 
     public int getTickHistorySize() {
         return tickHistorySize;
@@ -70,14 +81,6 @@ public class AngelOneProperties {
 
     public void setItmDepth(int itmDepth) {
         this.itmDepth = itmDepth;
-    }
-
-    public String getFixedItmStatePath() {
-        return fixedItmStatePath;
-    }
-
-    public void setFixedItmStatePath(String fixedItmStatePath) {
-        this.fixedItmStatePath = fixedItmStatePath;
     }
 
     public String getNiftyQuoteToken() {
