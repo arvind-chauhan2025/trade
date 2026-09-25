@@ -8,8 +8,11 @@ import org.springframework.stereotype.Service;
 
 import javax.sql.DataSource;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -123,5 +126,51 @@ public class EnrichedSnapshotPersistenceService {
      * (e.g. {@code atm_ce_expected30m}). */
     private static String toSnakeCase(String camelCase) {
         return camelCase.replaceAll("(?<=[a-z0-9])(?=[A-Z])", "_").toLowerCase();
+    }
+
+    /** Returns every persisted enriched snapshot row (all columns, dynamic schema included) for any trade
+     * date in {@code [fromDate, toDate]} (inclusive on both ends), ordered chronologically (date, then
+     * tick time). Each row is a plain column-name -> value map, since the table's columns grow dynamically
+     * as new fields are added to {@link PremiumReferenceService#enrich}. {@code tick_date} is normalized to
+     * a plain {@link LocalDate} (so it serializes as {@code "2026-09-24"} rather than a timestamp), and a
+     * combined {@code tickDateTime} (ISO {@code LocalDateTime}) field is added so multi-day results can be
+     * plotted on a single continuous timeline (e.g. an Angular chart) without recombining date + time
+     * client-side. */
+    public List<Map<String, Object>> getSnapshots(LocalDate fromDate, LocalDate toDate) {
+        List<Map<String, Object>> rows = jdbcTemplate.queryForList(
+                "SELECT * FROM " + TABLE + " WHERE tick_date BETWEEN ? AND ? ORDER BY tick_date, tick_time",
+                fromDate, toDate);
+        rows.forEach(this::normalizeRow);
+        return rows;
+    }
+
+    /** Coerces {@code tick_date} (returned by the JDBC driver as {@code java.sql.Date}, which Jackson would
+     * otherwise serialize as a timezone-shifted timestamp) into a plain {@link LocalDate}, and adds a
+     * {@code tickDateTime} field combining {@code tick_date} + {@code tick_time} for easy charting. */
+    private void normalizeRow(Map<String, Object> row) {
+        Object rawDate = row.get("tick_date");
+        LocalDate tickDate = rawDate instanceof java.sql.Date sqlDate ? sqlDate.toLocalDate()
+                : rawDate instanceof LocalDate ld ? ld
+                : LocalDate.parse(String.valueOf(rawDate));
+        row.put("tick_date", tickDate);
+
+        Object rawTime = row.get("tick_time");
+        if (rawTime != null) {
+            LocalTime tickTime = LocalTime.parse(String.valueOf(rawTime), DateTimeFormatter.ISO_LOCAL_TIME);
+            row.put("tickDateTime", LocalDateTime.of(tickDate, tickTime));
+        }
+    }
+
+    /** Returns every persisted enriched snapshot row whose (trade date + tick time) falls within
+     * {@code [from, to]} (inclusive on both ends), ordered chronologically. The date component of the
+     * bound narrows the SQL query; the exact time-of-day bound is then applied in-memory since
+     * {@code tick_time} may be stored without a fixed width (e.g. "09:15:00" vs "09:15:00.500000"). */
+    public List<Map<String, Object>> getSnapshots(LocalDateTime from, LocalDateTime to) {
+        return getSnapshots(from.toLocalDate(), to.toLocalDate()).stream()
+                .filter(row -> {
+                    LocalDateTime dateTime = (LocalDateTime) row.get("tickDateTime");
+                    return dateTime != null && !dateTime.isBefore(from) && !dateTime.isAfter(to);
+                })
+                .toList();
     }
 }

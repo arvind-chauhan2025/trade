@@ -1,6 +1,7 @@
 package com.example.demo.service;
 
 import com.example.demo.config.AngelOneProperties;
+import com.example.demo.dto.DatedTickSnapshot;
 import com.example.demo.dto.TickRecord;
 import com.example.demo.dto.TickSnapshot;
 import jakarta.annotation.PostConstruct;
@@ -8,12 +9,15 @@ import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Service;
 
 import javax.sql.DataSource;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.concurrent.BlockingQueue;
@@ -210,6 +214,49 @@ public class TickPersistenceService {
     /** Returns an immutable, chronologically-ordered snapshot of the whole map. */
     public Map<LocalTime, TickSnapshot> getSnapshots() {
         return new TreeMap<>(snapshotsByTime);
+    }
+
+    private static final RowMapper<DatedTickSnapshot> SNAPSHOT_ROW_MAPPER = (rs, rowNum) -> {
+        LocalDate tickDate = rs.getObject("tick_date", LocalDate.class);
+        LocalTime tickTime = LocalTime.parse(rs.getString("tick_time"), DateTimeFormatter.ISO_LOCAL_TIME);
+        TickSnapshot snapshot = new TickSnapshot(
+                tickTime,
+                (Double) rs.getObject("nifty"),
+                (Double) rs.getObject("atm_ce"), (Double) rs.getObject("atm_ce_strike"), (Double) rs.getObject("atm_ce_delta"),
+                (Double) rs.getObject("atm_pe"), (Double) rs.getObject("atm_pe_strike"), (Double) rs.getObject("atm_pe_delta"),
+                (Double) rs.getObject("fixed_itm_ce"), (Double) rs.getObject("fixed_itm_ce_strike"), (Double) rs.getObject("fixed_itm_ce_delta"),
+                (Double) rs.getObject("fixed_itm_pe"), (Double) rs.getObject("fixed_itm_pe_strike"), (Double) rs.getObject("fixed_itm_pe_delta"),
+                (Double) rs.getObject("nifty_fut"));
+        return new DatedTickSnapshot(tickDate, snapshot);
+    };
+
+    /** Returns every persisted complete {@link TickSnapshot} (from the {@code tick_snapshot} table) for
+     * any trade date in {@code [fromDate, toDate]} (inclusive on both ends), ordered chronologically
+     * (date, then tick time). Use this to fetch snapshots for "last N days". */
+    public List<DatedTickSnapshot> getSnapshots(LocalDate fromDate, LocalDate toDate) {
+        return jdbcTemplate.query("""
+                        SELECT tick_date, tick_time, nifty,
+                               atm_ce, atm_ce_strike, atm_ce_delta,
+                               atm_pe, atm_pe_strike, atm_pe_delta,
+                               fixed_itm_ce, fixed_itm_ce_strike, fixed_itm_ce_delta,
+                               fixed_itm_pe, fixed_itm_pe_strike, fixed_itm_pe_delta,
+                               nifty_fut
+                        FROM tick_snapshot WHERE tick_date BETWEEN ? AND ? ORDER BY tick_date, tick_time
+                        """,
+                SNAPSHOT_ROW_MAPPER, fromDate, toDate);
+    }
+
+    /** Returns every persisted complete {@link TickSnapshot} whose (trade date + tick time) falls within
+     * {@code [from, to]} (inclusive on both ends), ordered chronologically. The date component of the
+     * bound is used to narrow the SQL query; the exact time-of-day bound is then applied in-memory since
+     * {@code tick_time} may be stored without a fixed width (e.g. "09:15" vs "09:15:05"). */
+    public List<DatedTickSnapshot> getSnapshots(LocalDateTime from, LocalDateTime to) {
+        return getSnapshots(from.toLocalDate(), to.toLocalDate()).stream()
+                .filter(dated -> {
+                    LocalDateTime dateTime = LocalDateTime.of(dated.tickDate(), dated.snapshot().tickTime());
+                    return !dateTime.isBefore(from) && !dateTime.isAfter(to);
+                })
+                .toList();
     }
 
     private void drainLoop() {

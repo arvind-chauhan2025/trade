@@ -285,9 +285,10 @@ public class PremiumReferenceService {
 
     /** Returns a flattened view of {@code snapshot} (every TickSnapshot field) plus, once each reference
      * is available for today: {@code spotChange}/{@code spotChange30m} and, for ATM CE/PE and FIXED ITM
-     * CE/PE, the reference Gamma/Theta used, the expected premium and the actual-vs-expected divergence
-     * — one set from the fixed 9:15 day reference ({@code xExpected}/{@code xDivergence}) and one set
-     * from the rolling 30-minute reference ({@code xExpected30m}/{@code xDivergence30m}). Before a given
+     * CE/PE, the strike the reference was captured at, the reference Gamma/Theta used, the expected
+     * premium and the actual-vs-expected divergence — one set from the fixed 9:15 day reference
+     * ({@code xRefStrike}/{@code xExpected}/{@code xDivergence}) and one set from the rolling 30-minute
+     * reference ({@code xRefStrike30m}/{@code xExpected30m}/{@code xDivergence30m}). Before a given
      * reference is captured, its fields are present but {@code null}. */
     public Map<String, Object> enrich(TickSnapshot snapshot) {
         Map<String, Object> result = new LinkedHashMap<>();
@@ -336,6 +337,7 @@ public class PremiumReferenceService {
     private void putSide(Map<String, Object> result, String prefix, String suffix, Double actual, Double actualStrike,
                           Double referencePremium, Double referenceStrike,
                           Double delta, Double gamma, Double theta, double spotChange, double elapsedDays) {
+        result.put(prefix + "RefStrike" + suffix, referenceStrike);
         result.put(prefix + "Gamma" + suffix, gamma);
         result.put(prefix + "Theta" + suffix, theta);
         if (actual == null || referencePremium == null || delta == null || gamma == null || theta == null) {
@@ -367,6 +369,7 @@ public class PremiumReferenceService {
     }
 
     private void putSideNulls(Map<String, Object> result, String prefix, String suffix) {
+        result.put(prefix + "RefStrike" + suffix, null);
         result.put(prefix + "Gamma" + suffix, null);
         result.put(prefix + "Theta" + suffix, null);
         result.put(prefix + "Expected" + suffix, null);
