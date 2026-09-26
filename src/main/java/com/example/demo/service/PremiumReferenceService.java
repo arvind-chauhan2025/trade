@@ -307,6 +307,7 @@ public class PremiumReferenceService {
         result.put("fixedItmPeStrike", snapshot.fixedItmPeStrike());
         result.put("fixedItmPeDelta", snapshot.fixedItmPeDelta());
         result.put("niftyFut", snapshot.niftyFut());
+        result.put("rollingRefTime", rollingReference.time());
 
         applyReference(result, "", dayReference, dayReferenceDate, snapshot);
         applyReference(result, "30m", rollingReference, rollingReferenceDate, snapshot);
