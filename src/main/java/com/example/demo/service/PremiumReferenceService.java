@@ -357,16 +357,88 @@ public class PremiumReferenceService {
                     prefix, suffix, referenceStrike, actualStrike);
             return;
         }
-        double expected = referencePremium
-                + (delta * spotChange)
-                + (0.5 * gamma * spotChange * spotChange)
-                + (theta * elapsedDays);
+        double expected = expectedPremium(referencePremium, delta, gamma, theta, spotChange, elapsedDays);
         result.put(prefix + "Expected" + suffix, expected);
         result.put(prefix + "Divergence" + suffix, actual - expected);
         log.debug("{}{}: actual={} expected={} (ref={}, deltaTerm={}, gammaTerm={}, thetaTerm={}, elapsedDays={}, spotChange={}) divergence={}",
                 prefix, suffix, actual, expected, referencePremium,
                 delta * spotChange, 0.5 * gamma * spotChange * spotChange, theta * elapsedDays,
                 elapsedDays, spotChange, actual - expected);
+    }
+
+    /** The shared Delta-Gamma-Theta Taylor expansion formula (documented on the class), factored out so
+     * both {@link #putSide} (day/rolling reference divergence, per-tick enrichment) and the
+     * order-anchored divergence used by paper-trading exit checks ({@link #fixedItmCeDivergenceFrom} /
+     * {@link #fixedItmPeDivergenceFrom}) compute expected premium identically, without duplicating the
+     * math. */
+    private static double expectedPremium(double referencePremium, double delta, double gamma, double theta,
+                                           double spotChange, double elapsedDays) {
+        return referencePremium
+                + (delta * spotChange)
+                + (0.5 * gamma * spotChange * spotChange)
+                + (theta * elapsedDays);
+    }
+
+    /** A FIXED ITM CE/PE reference point anchored at a specific moment (e.g. a paper-trade entry), kept
+     * independent of the globally shared 30-minute {@link #rollingReference} (which keeps moving every 30
+     * minutes and would otherwise make a trade's exit divergence be measured against a baseline that has
+     * nothing to do with the trade's entry). Captured once via {@link #captureFixedItmOrderReference} and
+     * then reused for the lifetime of that trade with {@link #fixedItmCeDivergenceFrom} /
+     * {@link #fixedItmPeDivergenceFrom}. */
+    public record FixedItmOrderReference(
+            LocalTime time,
+            double nifty,
+            double ce, Double ceStrike, Double ceDelta, Double ceGamma, Double ceTheta,
+            double pe, Double peStrike, Double peDelta, Double peGamma, Double peTheta
+    ) {
+    }
+
+    /** Captures a {@link FixedItmOrderReference} from the current FIXED ITM CE/PE premiums/strikes and
+     * currently-cached Greeks, to be anchored to a single paper trade (independent of the shared rolling
+     * reference). Returns {@code null} if the snapshot or cached Greeks aren't fully populated yet. */
+    public FixedItmOrderReference captureFixedItmOrderReference(TickSnapshot snapshot) {
+        if (snapshot == null || snapshot.nifty() == null || snapshot.fixedItmCe() == null || snapshot.fixedItmPe() == null) {
+            return null;
+        }
+        return new FixedItmOrderReference(
+                snapshot.tickTime(), snapshot.nifty(),
+                snapshot.fixedItmCe(), snapshot.fixedItmCeStrike(),
+                greeksCacheService.getDelta("FIXED ITM CE"), greeksCacheService.getGamma("FIXED ITM CE"), greeksCacheService.getTheta("FIXED ITM CE"),
+                snapshot.fixedItmPe(), snapshot.fixedItmPeStrike(),
+                greeksCacheService.getDelta("FIXED ITM PE"), greeksCacheService.getGamma("FIXED ITM PE"), greeksCacheService.getTheta("FIXED ITM PE")
+        );
+    }
+
+    /** Divergence of the current FIXED ITM CE premium vs. {@code ref} (an order-anchored reference from
+     * {@link #captureFixedItmOrderReference}), using the same Taylor-expansion formula as the day/rolling
+     * references. Returns {@code null} if the reference/snapshot/Greeks aren't available, or if the
+     * FIXED ITM CE strike has changed since the reference was captured (comparing across a strike change
+     * would be meaningless). */
+    public Double fixedItmCeDivergenceFrom(FixedItmOrderReference ref, TickSnapshot snapshot) {
+        if (ref == null || snapshot == null || snapshot.nifty() == null || snapshot.fixedItmCe() == null
+                || snapshot.fixedItmCeStrike() == null || ref.ceStrike() == null
+                || Double.compare(snapshot.fixedItmCeStrike(), ref.ceStrike()) != 0
+                || ref.ceDelta() == null || ref.ceGamma() == null || ref.ceTheta() == null) {
+            return null;
+        }
+        double spotChange = snapshot.nifty() - ref.nifty();
+        double elapsedDays = Duration.between(ref.time(), snapshot.tickTime()).toMillis() / 86_400_000.0;
+        double expected = expectedPremium(ref.ce(), ref.ceDelta(), ref.ceGamma(), ref.ceTheta(), spotChange, elapsedDays);
+        return snapshot.fixedItmCe() - expected;
+    }
+
+    /** Same as {@link #fixedItmCeDivergenceFrom} but for the FIXED ITM PE leg. */
+    public Double fixedItmPeDivergenceFrom(FixedItmOrderReference ref, TickSnapshot snapshot) {
+        if (ref == null || snapshot == null || snapshot.nifty() == null || snapshot.fixedItmPe() == null
+                || snapshot.fixedItmPeStrike() == null || ref.peStrike() == null
+                || Double.compare(snapshot.fixedItmPeStrike(), ref.peStrike()) != 0
+                || ref.peDelta() == null || ref.peGamma() == null || ref.peTheta() == null) {
+            return null;
+        }
+        double spotChange = snapshot.nifty() - ref.nifty();
+        double elapsedDays = Duration.between(ref.time(), snapshot.tickTime()).toMillis() / 86_400_000.0;
+        double expected = expectedPremium(ref.pe(), ref.peDelta(), ref.peGamma(), ref.peTheta(), spotChange, elapsedDays);
+        return snapshot.fixedItmPe() - expected;
     }
 
     private void putSideNulls(Map<String, Object> result, String prefix, String suffix) {

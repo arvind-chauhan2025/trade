@@ -51,6 +51,7 @@ public class TickSnapshotBroadcastService {
     private final GreeksCacheService greeksCacheService;
     private final NiftyCandleService niftyCandleService;
     private final SupportResistanceService supportResistanceService;
+    private final PaperTradingService paperTradingService;
     private final ObjectMapper objectMapper = new ObjectMapper()
             .registerModule(new JavaTimeModule())
             .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
@@ -63,7 +64,8 @@ public class TickSnapshotBroadcastService {
                                          MockGreeksProperties mockGreeksProperties,
                                          GreeksCacheService greeksCacheService,
                                          NiftyCandleService niftyCandleService,
-                                         SupportResistanceService supportResistanceService) {
+                                         SupportResistanceService supportResistanceService,
+                                         PaperTradingService paperTradingService) {
         this.webSocketHandler = webSocketHandler;
         this.premiumReferenceService = premiumReferenceService;
         this.enrichedSnapshotPersistenceService = enrichedSnapshotPersistenceService;
@@ -73,6 +75,7 @@ public class TickSnapshotBroadcastService {
         this.greeksCacheService = greeksCacheService;
         this.niftyCandleService = niftyCandleService;
         this.supportResistanceService = supportResistanceService;
+        this.paperTradingService = paperTradingService;
     }
 
     @Scheduled(fixedRate = 5_000)
@@ -104,6 +107,7 @@ public class TickSnapshotBroadcastService {
 
         Map<String, Object> enriched = premiumReferenceService.enrich(snapshot);
         enrichedSnapshotPersistenceService.offer(enriched);
+        paperTradingService.onSnapshot(snapshot, enriched);
 
         if (webSocketHandler.getSessions().isEmpty()) {
             return;
