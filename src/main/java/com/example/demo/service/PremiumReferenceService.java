@@ -4,6 +4,7 @@ import com.example.demo.dto.TickSnapshot;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
@@ -79,10 +80,17 @@ public class PremiumReferenceService {
     private volatile ReferenceData dayReference;
     private volatile LocalDate rollingReferenceDate;
     private volatile ReferenceData rollingReference;
+    private volatile PaperTradingService paperTradingService;
 
-    public PremiumReferenceService(GreeksCacheService greeksCacheService, DataSource dataSource) {
+    // @Lazy breaks the PremiumReferenceService <-> PaperTradingService constructor-injection cycle:
+    // PaperTradingService needs a fully-constructed PremiumReferenceService, and PremiumReferenceService
+    // only needs PaperTradingService for the occasional hasOpenPosition() check below, never during
+    // construction, so a lazy proxy here is sufficient and avoids Spring's "dependencies form a cycle" error.
+    public PremiumReferenceService(GreeksCacheService greeksCacheService, DataSource dataSource,
+                                    @Lazy PaperTradingService paperTradingService) {
         this.greeksCacheService = greeksCacheService;
         this.jdbcTemplate = new JdbcTemplate(dataSource);
+        this.paperTradingService = paperTradingService;
     }
 
     /** Creates the {@code premium_reference} table if needed, then restores today's day/rolling
@@ -230,6 +238,10 @@ public class PremiumReferenceService {
                     snapshot.tickTime(), snapshot.nifty(), snapshot.atmCe(), snapshot.atmPe(), snapshot.fixedItmCe(), snapshot.fixedItmPe());
         }
         if (rollingReferenceMissingToday || rollingIntervalElapsed) {
+            if (paperTradingService.hasOpenPosition()) {
+                log.debug("30-min rolling window elapsed but a paper trade is currently open; rollingReference until it closes");
+                return;
+            }
             rollingReference = captured;
             rollingReferenceDate = today;
             persist(ROLLING_REF_TYPE, today, captured);

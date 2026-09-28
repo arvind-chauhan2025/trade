@@ -214,11 +214,11 @@ public class PaperTradingService {
             // CE exit: weaker (closer-to-neutral) reversal threshold than entry, so we exit as soon as the
             // divergence starts fading rather than waiting for a full opposite-signal reversal.
             exitTrigger = anchoredCeDivergence != null && anchoredPeDivergence != null
-                    && (anchoredCeDivergence < properties.getCeExitThreshold() && anchoredPeDivergence > properties.getPeExitThreshold());
+                    && (ceDivergence30m < properties.getCeExitThreshold() && peDivergence30m > properties.getPeExitThreshold());
         } else {
             // PE exit: mirror of the CE exit condition using the negated exit thresholds.
             exitTrigger = anchoredCeDivergence != null && anchoredPeDivergence != null
-                    && (anchoredCeDivergence > -properties.getCeExitThreshold() && anchoredPeDivergence < -properties.getPeExitThreshold());
+                    && (ceDivergence30m > -properties.getCeExitThreshold() && peDivergence30m < -properties.getPeExitThreshold());
         }
         exitStreak = exitTrigger ? exitStreak + 1 : 0;
 
