@@ -66,6 +66,11 @@ public class PaperTradingService {
     private int entryBullishStreak;
     private int entryBearishStreak;
     private int exitStreak;
+    /** Consecutive snapshots {@code fixedItmCeDivergence30m}/{@code fixedItmPeDivergence30m} alone has
+     * exceeded {@link PaperTradingProperties#getFastEntryDivergenceThreshold()}, driving the fast-entry
+     * path in {@link #handleEntry}. */
+    private int fastEntryCeStreak;
+    private int fastEntryPeStreak;
     private LocalTime lastProcessedTickTime;
 
     public PaperTradingService(PremiumReferenceService premiumReferenceService,
@@ -131,6 +136,20 @@ public class PaperTradingService {
     }
 
     private void handleEntry(TickSnapshot snapshot, Double ceDivergence30m, Double peDivergence30m) {
+        boolean fastCe = ceDivergence30m != null && ceDivergence30m > properties.getFastEntryDivergenceThreshold();
+        boolean fastPe = peDivergence30m != null && peDivergence30m > properties.getFastEntryDivergenceThreshold();
+        fastEntryCeStreak = fastCe ? fastEntryCeStreak + 1 : 0;
+        fastEntryPeStreak = fastPe ? fastEntryPeStreak + 1 : 0;
+
+        if (fastEntryCeStreak >= properties.getFastEntryConfirmationTicks()) {
+            openPosition("CE", snapshot, ceDivergence30m, peDivergence30m, "FAST");
+            return;
+        }
+        if (fastEntryPeStreak >= properties.getFastEntryConfirmationTicks()) {
+            openPosition("PE", snapshot, ceDivergence30m, peDivergence30m, "FAST");
+            return;
+        }
+
         boolean bullish = ceDivergence30m != null && peDivergence30m != null
                 && ceDivergence30m > properties.getCeBullishThreshold() && peDivergence30m < properties.getPeBullishThreshold();
         boolean bearish = ceDivergence30m != null && peDivergence30m != null
@@ -148,13 +167,14 @@ public class PaperTradingService {
         }
 
         if (entryBullishStreak >= properties.getConfirmationTicks()) {
-            openPosition("CE", snapshot, ceDivergence30m, peDivergence30m);
+            openPosition("CE", snapshot, ceDivergence30m, peDivergence30m, "REGULAR");
         } else if (entryBearishStreak >= properties.getConfirmationTicks()) {
-            openPosition("PE", snapshot, ceDivergence30m, peDivergence30m);
+            openPosition("PE", snapshot, ceDivergence30m, peDivergence30m, "REGULAR");
         }
     }
 
-    private void openPosition(String direction, TickSnapshot snapshot, Double ceDivergence30m, Double peDivergence30m) {
+    private void openPosition(String direction, TickSnapshot snapshot, Double ceDivergence30m, Double peDivergence30m,
+                               String entryType) {
         Double entryPremium = "CE".equals(direction) ? snapshot.fixedItmCe() : snapshot.fixedItmPe();
         Double entryStrike = "CE".equals(direction) ? snapshot.fixedItmCeStrike() : snapshot.fixedItmPeStrike();
         PremiumReferenceService.FixedItmOrderReference reference = premiumReferenceService.captureFixedItmOrderReference(snapshot);
@@ -164,18 +184,20 @@ public class PaperTradingService {
         }
 
         PaperOrderState order = new PaperOrderState(LocalDate.now(), direction, snapshot.tickTime(),
-                snapshot.nifty(), entryPremium, entryStrike, reference);
+                snapshot.nifty(), entryPremium, entryStrike, reference, entryType);
         long id = orderPersistenceService.insertOpen(order, properties);
         order.id = id;
         openOrder = order;
         entryBullishStreak = 0;
         entryBearishStreak = 0;
         exitStreak = 0;
+        fastEntryCeStreak = 0;
+        fastEntryPeStreak = 0;
 
         snapshotPersistenceService.insert(id, order.tradeDate, snapshot.tickTime(), snapshot.nifty(),
                 snapshot.fixedItmCe(), snapshot.fixedItmPe(), ceDivergence30m, peDivergence30m, 0.0, 0.0, "ENTRY");
-        log.info("Paper trade ENTRY: direction={} time={} entryPremium={} nifty={}",
-                direction, snapshot.tickTime(), entryPremium, snapshot.nifty());
+        log.info("Paper trade ENTRY: direction={} entryType={} time={} entryPremium={} nifty={}",
+                direction, entryType, snapshot.tickTime(), entryPremium, snapshot.nifty());
     }
 
     private void handleOpenOrder(TickSnapshot snapshot, Double ceDivergence30m, Double peDivergence30m) {
@@ -192,23 +214,60 @@ public class PaperTradingService {
             // CE exit: weaker (closer-to-neutral) reversal threshold than entry, so we exit as soon as the
             // divergence starts fading rather than waiting for a full opposite-signal reversal.
             exitTrigger = anchoredCeDivergence != null && anchoredPeDivergence != null
-                    && (anchoredCeDivergence < properties.getCeExitThreshold() || anchoredPeDivergence > properties.getPeExitThreshold());
+                    && (anchoredCeDivergence < properties.getCeExitThreshold() && anchoredPeDivergence > properties.getPeExitThreshold());
         } else {
             // PE exit: mirror of the CE exit condition using the negated exit thresholds.
             exitTrigger = anchoredCeDivergence != null && anchoredPeDivergence != null
-                    && (anchoredCeDivergence > -properties.getCeExitThreshold() || anchoredPeDivergence < -properties.getPeExitThreshold());
+                    && (anchoredCeDivergence > -properties.getCeExitThreshold() && anchoredPeDivergence < -properties.getPeExitThreshold());
         }
         exitStreak = exitTrigger ? exitStreak + 1 : 0;
+
+        Double directionalDivergence = "CE".equals(order.direction) ? anchoredCeDivergence : anchoredPeDivergence;
+        boolean trailingExitTrigger = updateDivergenceTrailingState(order, directionalDivergence);
 
         if (exitStreak >= properties.getConfirmationTicks() && actualPremium != null && snapshot.nifty() != null) {
             closePosition(order, snapshot, actualPremium, "DIVERGENCE_REVERSAL");
             event = "EXIT_DIVERGENCE";
             exitStreak = 0;
+        } else if (trailingExitTrigger && actualPremium != null && snapshot.nifty() != null) {
+            closePosition(order, snapshot, actualPremium, "DIVERGENCE_TRAILING_RETRACEMENT");
+            event = "EXIT_DIVERGENCE_TRAILING";
         }
 
         snapshotPersistenceService.insert(order.id, order.tradeDate, snapshot.tickTime(), snapshot.nifty(),
                 snapshot.fixedItmCe(), snapshot.fixedItmPe(), ceDivergence30m, peDivergence30m,
                 anchoredCeDivergence, anchoredPeDivergence, event);
+    }
+
+    /** Divergence-trailing exit: tracks {@code order.peakDivergence} (the highest order-anchored
+     * divergence — CE for a CE trade, PE for a PE trade — seen since entry) and, once divergence starts
+     * pulling back from that peak, counts consecutive falling ticks in {@code order.trailingFallStreak}.
+     * A new peak (a value higher than the current peak) always resets the fall streak, since the trade is
+     * still making fresh highs. Returns {@code true} once both {@link PaperTradingProperties#getDivergenceTrailingConfirmationCount()}
+     * consecutive falling ticks and a retracement from the peak of at least
+     * {@link PaperTradingProperties#getCeDivergenceTrailingRetracement()} (CE trade) or
+     * {@link PaperTradingProperties#getPeDivergenceTrailingRetracement()} (PE trade) have been observed —
+     * evaluated every tick alongside (never replacing) the existing plain divergence-reversal exit above. */
+    private boolean updateDivergenceTrailingState(PaperOrderState order, Double currentDivergence) {
+        if (currentDivergence == null) {
+            return false;
+        }
+        if (order.peakDivergence == null || currentDivergence > order.peakDivergence) {
+            order.peakDivergence = currentDivergence;
+            order.trailingFallStreak = 0;
+        } else if (order.previousDivergence != null && currentDivergence < order.previousDivergence) {
+            order.trailingFallStreak++;
+        } else {
+            order.trailingFallStreak = 0;
+        }
+        order.previousDivergence = currentDivergence;
+
+        double retracement = "CE".equals(order.direction)
+                ? properties.getCeDivergenceTrailingRetracement()
+                : properties.getPeDivergenceTrailingRetracement();
+
+        return order.trailingFallStreak >= properties.getDivergenceTrailingConfirmationCount()
+                && (order.peakDivergence - currentDivergence) >= retracement;
     }
 
     /** Updates the highest premium seen since entry and, if not already hit, checks/records the

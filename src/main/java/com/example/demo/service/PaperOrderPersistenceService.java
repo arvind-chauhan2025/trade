@@ -56,6 +56,7 @@ public class PaperOrderPersistenceService {
                     ce_bearish_threshold DOUBLE PRECISION,
                     pe_bearish_threshold DOUBLE PRECISION,
                     confirmation_ticks INTEGER,
+                    entry_type VARCHAR(10),
                     highest_premium DOUBLE PRECISION,
                     hypothetical_sl_hit BOOLEAN NOT NULL DEFAULT FALSE,
                     hypothetical_sl_exit_price DOUBLE PRECISION,
@@ -77,6 +78,7 @@ public class PaperOrderPersistenceService {
         jdbcTemplate.execute("ALTER TABLE paper_order ADD COLUMN IF NOT EXISTS ce_bearish_threshold DOUBLE PRECISION");
         jdbcTemplate.execute("ALTER TABLE paper_order ADD COLUMN IF NOT EXISTS pe_bearish_threshold DOUBLE PRECISION");
         jdbcTemplate.execute("ALTER TABLE paper_order ADD COLUMN IF NOT EXISTS confirmation_ticks INTEGER");
+        jdbcTemplate.execute("ALTER TABLE paper_order ADD COLUMN IF NOT EXISTS entry_type VARCHAR(10)");
     }
 
     /** Inserts a newly opened paper trade and returns its generated id. Also records the exact
@@ -84,7 +86,9 @@ public class PaperOrderPersistenceService {
      * for later auditing (e.g. did a config change explain a since-observed behavior difference): for a
      * CE trade, {@code ceBullishThreshold}/{@code peBullishThreshold} are stored (bearish columns left
      * null); for a PE trade, {@code ceBearishThreshold}/{@code peBearishThreshold} are stored (bullish
-     * columns left null). {@code confirmationTicks} is always stored regardless of direction. */
+     * columns left null). {@code confirmationTicks} is always stored regardless of direction.
+     * {@code order.entryType} ({@code "FAST"} or {@code "REGULAR"}) is also stored verbatim, so it's
+     * possible to distinguish which entry path opened this trade later. */
     public long insertOpen(PaperOrderState order, PaperTradingProperties properties) {
         PremiumReferenceService.FixedItmOrderReference ref = order.reference;
         boolean isCe = "CE".equals(order.direction);
@@ -98,16 +102,17 @@ public class PaperOrderPersistenceService {
                     ref_time, ref_nifty, ref_ce, ref_ce_strike, ref_ce_delta, ref_ce_gamma, ref_ce_theta,
                     ref_pe, ref_pe_strike, ref_pe_delta, ref_pe_gamma, ref_pe_theta,
                     ce_bullish_threshold, pe_bullish_threshold, ce_bearish_threshold, pe_bearish_threshold,
-                    confirmation_ticks, highest_premium
-                ) VALUES (?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    confirmation_ticks, entry_type, highest_premium
+                ) VALUES (?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING id
                 """, Long.class,
                 order.tradeDate, order.direction, order.entryTime.toString(), order.entryNifty, order.entryPremium, order.entryStrike,
                 ref.time().toString(), ref.nifty(), ref.ce(), ref.ceStrike(), ref.ceDelta(), ref.ceGamma(), ref.ceTheta(),
                 ref.pe(), ref.peStrike(), ref.peDelta(), ref.peGamma(), ref.peTheta(),
                 ceBullishThreshold, peBullishThreshold, ceBearishThreshold, peBearishThreshold,
-                properties.getConfirmationTicks(), order.highestPremium);
-        log.info("Paper trade OPENED id={} direction={} entryTime={} entryPremium={}", id, order.direction, order.entryTime, order.entryPremium);
+                properties.getConfirmationTicks(), order.entryType, order.highestPremium);
+        log.info("Paper trade OPENED id={} direction={} entryType={} entryTime={} entryPremium={}",
+                id, order.direction, order.entryType, order.entryTime, order.entryPremium);
         return id;
     }
 
@@ -173,6 +178,7 @@ public class PaperOrderPersistenceService {
                 nullableDouble(rs, "ce_bullish_threshold"), nullableDouble(rs, "pe_bullish_threshold"),
                 nullableDouble(rs, "ce_bearish_threshold"), nullableDouble(rs, "pe_bearish_threshold"),
                 nullableInt(rs, "confirmation_ticks"),
+                rs.getString("entry_type"),
                 nullableDouble(rs, "highest_premium"),
                 rs.getBoolean("hypothetical_sl_hit"), nullableDouble(rs, "hypothetical_sl_exit_price"),
                 slExitTime != null ? LocalTime.parse(slExitTime) : null, nullableDouble(rs, "hypothetical_sl_pnl"),
@@ -190,7 +196,7 @@ public class PaperOrderPersistenceService {
             double refCe, Double refCeStrike, Double refCeDelta, Double refCeGamma, Double refCeTheta,
             double refPe, Double refPeStrike, Double refPeDelta, Double refPeGamma, Double refPeTheta,
             Double ceBullishThreshold, Double peBullishThreshold, Double ceBearishThreshold, Double peBearishThreshold,
-            Integer confirmationTicks,
+            Integer confirmationTicks, String entryType,
             Double highestPremium,
             boolean hypotheticalSlHit, Double hypotheticalSlExitPrice, LocalTime hypotheticalSlExitTime, Double hypotheticalSlPnl,
             LocalTime exitTime, Double exitNifty, Double exitPremium, String exitReason, Double pnl,
@@ -205,7 +211,7 @@ public class PaperOrderPersistenceService {
         PaperOrderState order = new PaperOrderState(
                 rs.getDate("trade_date").toLocalDate(), rs.getString("direction"),
                 LocalTime.parse(rs.getString("entry_time")), rs.getDouble("entry_nifty"),
-                rs.getDouble("entry_premium"), nullableDouble(rs, "entry_strike"), ref);
+                rs.getDouble("entry_premium"), nullableDouble(rs, "entry_strike"), ref, rs.getString("entry_type"));
         order.highestPremium = rs.getDouble("highest_premium");
         order.hypotheticalSlHit = rs.getBoolean("hypothetical_sl_hit");
         order.hypotheticalSlExitPrice = nullableDouble(rs, "hypothetical_sl_exit_price");
