@@ -16,6 +16,7 @@ import java.time.LocalTime;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Captures two reference points for the trading day and, for every later {@link TickSnapshot}, computes
@@ -68,6 +69,11 @@ public class PremiumReferenceService {
 
     private final GreeksCacheService greeksCacheService;
     private final JdbcTemplate jdbcTemplate;
+    /** Set {@code true} by {@link #resetRollingReference()} and consumed (read-then-cleared) by the very
+     * next {@link #enrich} call, so exactly one enriched snapshot/broadcast cycle after an ATM/ITM
+     * strike-driven rolling reference reset reports {@code resetAtmItm=true}; every other cycle reports
+     * {@code false}. */
+    private final AtomicBoolean resetAtmItmFlag = new AtomicBoolean(false);
 
     private volatile LocalDate dayReferenceDate;
     private volatile ReferenceData dayReference;
@@ -273,6 +279,7 @@ public class PremiumReferenceService {
     public void resetRollingReference() {
         rollingReference = null;
         rollingReferenceDate = null;
+        resetAtmItmFlag.set(true);
         try {
             jdbcTemplate.update("DELETE FROM premium_reference WHERE ref_type = ? AND tick_date = ?",
                     ROLLING_REF_TYPE, LocalDate.now());
@@ -308,6 +315,9 @@ public class PremiumReferenceService {
         result.put("fixedItmPeDelta", snapshot.fixedItmPeDelta());
         result.put("niftyFut", snapshot.niftyFut());
         result.put("rollingRefTime", rollingReference.time());
+        // true only for the one enriched snapshot right after resetRollingReference() fired (an ATM/ITM
+        // strike change), false on every other cycle.
+        result.put("resetAtmItm", resetAtmItmFlag.getAndSet(false));
 
         applyReference(result, "", dayReference, dayReferenceDate, snapshot);
         applyReference(result, "30m", rollingReference, rollingReferenceDate, snapshot);

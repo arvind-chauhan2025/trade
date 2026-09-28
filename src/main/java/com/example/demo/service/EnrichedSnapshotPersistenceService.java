@@ -81,7 +81,7 @@ public class EnrichedSnapshotPersistenceService {
             }
             columns.put(toSnakeCase(entry.getKey()), entry.getValue());
         }
-        ensureColumnsExist(columns.keySet());
+        ensureColumnsExist(columns);
 
         StringBuilder insertCols = new StringBuilder("tick_date, tick_time");
         StringBuilder placeholders = new StringBuilder("?, ?");
@@ -98,7 +98,7 @@ public class EnrichedSnapshotPersistenceService {
                 updateClause.append(", ");
             }
             updateClause.append(column.getKey()).append(" = EXCLUDED.").append(column.getKey());
-            args[i] = toDouble(column.getValue());
+            args[i] = toColumnValue(column.getValue());
             i++;
         }
 
@@ -107,15 +107,26 @@ public class EnrichedSnapshotPersistenceService {
         jdbcTemplate.update(sql, args);
     }
 
-    private void ensureColumnsExist(Set<String> columns) {
-        for (String column : columns) {
-            if (knownColumns.add(column)) {
-                jdbcTemplate.execute("ALTER TABLE " + TABLE + " ADD COLUMN IF NOT EXISTS " + column + " DOUBLE PRECISION");
+    /** Creates any not-yet-seen column on demand, typed as {@code BOOLEAN} if its current value is a
+     * {@link Boolean} (e.g. {@code resetAtmItm}) or {@code DOUBLE PRECISION} otherwise (the existing
+     * default for every numeric enrich() field). Once a column is created its type is fixed, so a given
+     * enrich() key must consistently produce the same value type across calls. */
+    private void ensureColumnsExist(Map<String, Object> columns) {
+        for (Map.Entry<String, Object> column : columns.entrySet()) {
+            if (knownColumns.add(column.getKey())) {
+                String type = column.getValue() instanceof Boolean ? "BOOLEAN" : "DOUBLE PRECISION";
+                jdbcTemplate.execute("ALTER TABLE " + TABLE + " ADD COLUMN IF NOT EXISTS " + column.getKey() + " " + type);
             }
         }
     }
 
-    private Double toDouble(Object value) {
+    /** Converts an enrich() map value into the value written to its column: {@link Boolean} values are
+     * passed through as-is (for {@code BOOLEAN} columns), {@link Number} values are widened to
+     * {@code Double} (for {@code DOUBLE PRECISION} columns), anything else is stored as {@code NULL}. */
+    private Object toColumnValue(Object value) {
+        if (value instanceof Boolean bool) {
+            return bool;
+        }
         if (value instanceof Number number) {
             return number.doubleValue();
         }

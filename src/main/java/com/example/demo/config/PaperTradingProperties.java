@@ -14,6 +14,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * trading.paper.pe-bullish-threshold=-2.0
  * trading.paper.ce-bearish-threshold=-2.0
  * trading.paper.pe-bearish-threshold=3.0
+ * trading.paper.ce-exit-threshold=1.0
+ * trading.paper.pe-exit-threshold=-1.0
  * trading.paper.sl-percentage=30.0
  * </pre>
  */
@@ -40,6 +42,17 @@ public class PaperTradingProperties {
     /** Entry: fixedItmPeDivergence30m must be strictly greater than this for a bearish (PE) signal, and
      * also used (against the order-anchored PE divergence) to confirm an open CE position's exit. */
     private double peBearishThreshold = 3.0;
+
+    /** Exit: a much weaker (closer-to-neutral) threshold than the entry thresholds, so a trade exits as
+     * soon as the divergence starts reverting rather than waiting for a full opposite-signal reversal.
+     * A CE trade exits once the order-anchored CE divergence drops below this value (default 1.0); a PE
+     * trade exits once the order-anchored CE divergence rises above the negation of this value. */
+    private double ceExitThreshold = 1.0;
+
+    /** Exit: a much weaker (closer-to-neutral) threshold than the entry thresholds. A CE trade exits once
+     * the order-anchored PE divergence rises above this value (default -1.0); a PE trade exits once the
+     * order-anchored PE divergence drops below the negation of this value. */
+    private double peExitThreshold = -1.0;
 
     /** Hypothetical (analysis-only) trailing stop-loss, as a percentage drop from the highest premium
      * observed since entry. Never triggers a real exit or Angel One order. Default 30%. */
@@ -91,6 +104,22 @@ public class PaperTradingProperties {
 
     public void setPeBearishThreshold(double peBearishThreshold) {
         this.peBearishThreshold = peBearishThreshold;
+    }
+
+    public double getCeExitThreshold() {
+        return ceExitThreshold;
+    }
+
+    public void setCeExitThreshold(double ceExitThreshold) {
+        this.ceExitThreshold = ceExitThreshold;
+    }
+
+    public double getPeExitThreshold() {
+        return peExitThreshold;
+    }
+
+    public void setPeExitThreshold(double peExitThreshold) {
+        this.peExitThreshold = peExitThreshold;
     }
 
     public double getSlPercentage() {

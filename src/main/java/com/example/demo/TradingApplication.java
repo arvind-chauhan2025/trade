@@ -7,6 +7,8 @@ import com.example.demo.service.AngelOneAuthService;
 import com.example.demo.service.AngelOneMarketDataService;
 import com.example.demo.service.NiftyOptionSelector;
 import com.example.demo.service.NiftySpotPriceService;
+import com.example.demo.service.PaperTradeClosedEvent;
+import com.example.demo.service.PaperTradingService;
 import com.example.demo.service.PremiumReferenceService;
 import com.example.demo.service.ScripMasterService;
 import com.example.demo.service.FixedItmSelectionService;
@@ -24,6 +26,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
+import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -41,6 +44,15 @@ import org.springframework.stereotype.Component;
  * every {@code angelone.atm-itm-reselect-minutes} (default 30) minutes during
  * the day using the latest live spot, so strikes track the market intraday
  * while staying fixed for the rest of each window.
+ * <p>
+ * A strike swap unsubscribes the old strike's live feed and re-anchors the shared rolling premium
+ * reference, which would silently corrupt an in-flight {@code PaperTradingService} trade (its
+ * entry-anchored reference/live premium belongs to the strike being dropped). So while
+ * {@link PaperTradingService#hasOpenPosition()} is {@code true}, {@link #reselectAtmItmIfWindowElapsed()}
+ * defers re-selection entirely — even if its 30-minute window has elapsed — and only proceeds once that
+ * trade closes. {@link #onPaperTradeClosed(PaperTradeClosedEvent)} listens for the trade's close event
+ * and immediately re-checks, so a re-selection overdue during the trade fires right away instead of
+ * waiting up to a minute for the next scheduled tick.
  */
 @Component
 public class TradingApplication implements ApplicationRunner {
@@ -57,6 +69,7 @@ public class TradingApplication implements ApplicationRunner {
     private final FixedItmSelectionService fixedItmSelectionService;
     private final GreeksCacheService greeksCacheService;
     private final PremiumReferenceService premiumReferenceService;
+    private final PaperTradingService paperTradingService;
 
     @Value("${trading.run-on-startup:false}")
     private boolean OnStartup;
@@ -78,7 +91,8 @@ public class TradingApplication implements ApplicationRunner {
                                AngelOneProperties properties,
                                FixedItmSelectionService fixedItmSelectionService,
                                GreeksCacheService greeksCacheService,
-                               PremiumReferenceService premiumReferenceService) {
+                               PremiumReferenceService premiumReferenceService,
+                               PaperTradingService paperTradingService) {
         this.niftySpotPriceService = niftySpotPriceService;
         this.scripMasterService = scripMasterService;
         this.niftyOptionSelector = niftyOptionSelector;
@@ -88,7 +102,9 @@ public class TradingApplication implements ApplicationRunner {
         this.fixedItmSelectionService = fixedItmSelectionService;
         this.greeksCacheService = greeksCacheService;
         this.premiumReferenceService = premiumReferenceService;
+        this.paperTradingService = paperTradingService;
     }
+
 
     /**
      * When {@code trading.run-on-startup=true}, invokes {@link #startPipeline()} once
@@ -189,6 +205,11 @@ public class TradingApplication implements ApplicationRunner {
      * contracts, and the premium reference's rolling baseline is invalidated (via
      * {@link PremiumReferenceService#resetRollingReference()}) so a stale strike's captured premium (e.g.
      * ATM 23400) is never compared against a different, now-current strike's premium (e.g. ATM 23550).
+     * <p>
+     * While {@link PaperTradingService#hasOpenPosition()} is {@code true}, re-selection is deferred
+     * entirely (even past an elapsed window) so the open trade's entry strike keeps streaming and its
+     * anchored reference stays valid for its whole lifetime; {@link #onPaperTradeClosed} re-checks
+     * immediately once that trade closes.
      */
     @Scheduled(fixedRate = 60_000)
     public void reselectAtmItmIfWindowElapsed() {
@@ -198,6 +219,10 @@ public class TradingApplication implements ApplicationRunner {
         Instant last = lastAtmItmSelectionAt;
         Duration window = Duration.ofMinutes(Math.max(1, properties.getAtmItmReselectMinutes()));
         if (last == null || Duration.between(last, Instant.now()).compareTo(window) < 0) {
+            return;
+        }
+        if (paperTradingService.hasOpenPosition()) {
+            log.debug("30-min rolling window elapsed but a paper trade is currently open; deferring ATM/ITM re-selection until it closes");
             return;
         }
 
@@ -246,6 +271,16 @@ public class TradingApplication implements ApplicationRunner {
         } finally {
             lastAtmItmSelectionAt = Instant.now();
         }
+    }
+
+    /** Fired the instant {@code PaperTradingService} closes a paper trade. Immediately re-checks whether
+     * the 30-minute ATM/ITM window had already elapsed but was deferred while that trade was open, so
+     * re-selection happens right away instead of waiting up to a minute for the next scheduled tick. */
+    @EventListener
+    public void onPaperTradeClosed(PaperTradeClosedEvent event) {
+        log.info("Paper trade id={} ({}) closed at {}; re-checking deferred ATM/ITM re-selection",
+                event.orderId(), event.direction(), event.exitTime());
+        reselectAtmItmIfWindowElapsed();
     }
 
     /** Prefers the latest live tick's NIFTY price (no extra REST call); falls back to the Market Quote

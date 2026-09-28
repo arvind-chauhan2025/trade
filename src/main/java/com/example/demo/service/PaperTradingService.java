@@ -5,9 +5,11 @@ import com.example.demo.dto.TickSnapshot;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.util.Map;
 import java.util.Optional;
 
@@ -29,7 +31,11 @@ import java.util.Optional;
  *     moving, each trade instead gets its own anchored {@link PremiumReferenceService.FixedItmOrderReference}
  *     captured at entry time; the exit condition re-evaluates the CE/PE divergence against that fixed
  *     anchor (not the shared rolling one) for the trade's confirmation window, so exits reflect genuine
- *     reversal from the trade's own entry point.</li>
+ *     reversal from the trade's own entry point. Exit uses its own, much weaker (closer-to-neutral)
+ *     {@link PaperTradingProperties#getCeExitThreshold()}/{@link PaperTradingProperties#getPeExitThreshold()}
+ *     thresholds rather than the entry thresholds, so a CE trade exits once anchored CE divergence
+ *     drops below (or anchored PE divergence rises above) that threshold — no need to wait for a full
+ *     opposite-signal reversal; a PE trade mirrors this with the negated thresholds.</li>
  *     <li><b>Hypothetical SL</b> — analysis only. A trailing stop (percentage below the highest premium
  *     seen since entry) is tracked and recorded ({@code hypotheticalSlHit}/{@code ExitPrice}/{@code ExitTime})
  *     purely for later P&amp;L comparison against the real divergence-based exit. It never changes
@@ -37,6 +43,13 @@ import java.util.Optional;
  * </ul>
  * Every tick a trade is open, its NIFTY price, FIXED ITM CE/PE premiums, global 30-minute divergence and
  * order-anchored divergence are persisted via {@link OrderSnapshotPersistenceService} for full auditability.
+ * <p>
+ * {@code TradingApplication}'s 30-minute ATM/ITM rolling re-selection swaps live strikes/subscriptions,
+ * which would otherwise invalidate an open trade's entry-anchored reference and its live premium feed
+ * mid-trade. To avoid that, {@link #hasOpenPosition()} lets {@code TradingApplication} defer that
+ * re-selection entirely while a trade is open, and a {@link PaperTradeClosedEvent} is published the
+ * instant a trade closes so any re-selection that was overdue during the trade fires immediately rather
+ * than waiting up to a minute for the next scheduled check.
  */
 @Service
 public class PaperTradingService {
@@ -47,21 +60,33 @@ public class PaperTradingService {
     private final PaperOrderPersistenceService orderPersistenceService;
     private final OrderSnapshotPersistenceService snapshotPersistenceService;
     private final PaperTradingProperties properties;
+    private final ApplicationEventPublisher eventPublisher;
 
     private volatile PaperOrderState openOrder;
     private int entryBullishStreak;
     private int entryBearishStreak;
     private int exitStreak;
+    private LocalTime lastProcessedTickTime;
 
     public PaperTradingService(PremiumReferenceService premiumReferenceService,
                                 PaperOrderPersistenceService orderPersistenceService,
                                 OrderSnapshotPersistenceService snapshotPersistenceService,
-                                PaperTradingProperties properties) {
+                                PaperTradingProperties properties,
+                                ApplicationEventPublisher eventPublisher) {
         this.premiumReferenceService = premiumReferenceService;
         this.orderPersistenceService = orderPersistenceService;
         this.snapshotPersistenceService = snapshotPersistenceService;
         this.properties = properties;
+        this.eventPublisher = eventPublisher;
     }
+
+    /** Returns {@code true} while a paper trade is currently open. Used by {@code TradingApplication} to
+     * defer the 30-minute ATM/ITM rolling re-selection until the trade closes, so an open trade's entry
+     * strike/anchored reference (and live premium feed) is never invalidated mid-trade by a strike swap. */
+    public boolean hasOpenPosition() {
+        return openOrder != null;
+    }
+
 
     /** Resumes tracking a still-open paper trade across a restart, using its persisted entry-anchored
      * reference so exit-divergence confirmation isn't lost. */
@@ -77,11 +102,24 @@ public class PaperTradingService {
 
     /** Called once per 5-second broadcast cycle with the same snapshot/enriched map already computed for
      * the WebSocket broadcast + {@code enriched_snapshot} persistence. No-op if
-     * {@link PaperTradingProperties#isEnabled()} is {@code false}. */
+     * {@link PaperTradingProperties#isEnabled()} is {@code false}. Also a no-op if {@code snapshot.tickTime()}
+     * is the same as the last processed cycle's — i.e. the live feed didn't produce a new complete tick since
+     * the last broadcast cycle and {@code TickPersistenceService#getLatestCompleteSnapshot()} is just
+     * returning its previously cached snapshot again. Without this guard, a stalled feed would silently
+     * re-count the same stale divergence towards {@link #entryBullishStreak}/{@link #entryBearishStreak}
+     * (or {@link #exitStreak}) on every 5-second cycle, letting a real confirmation streak complete far
+     * faster than {@link PaperTradingProperties#getConfirmationTicks()} actual distinct ticks intend. */
     public synchronized void onSnapshot(TickSnapshot snapshot, Map<String, Object> enriched) {
         if (!properties.isEnabled() || snapshot == null || snapshot.tickTime() == null) {
             return;
         }
+        if (snapshot.tickTime().equals(lastProcessedTickTime)) {
+            log.debug("Skipping paper-trading cycle: tickTime={} unchanged since last processed cycle (feed stalled?)",
+                    snapshot.tickTime());
+            return;
+        }
+        lastProcessedTickTime = snapshot.tickTime();
+
         Double ceDivergence30m = asDouble(enriched.get("fixedItmCeDivergence30m"));
         Double peDivergence30m = asDouble(enriched.get("fixedItmPeDivergence30m"));
 
@@ -127,7 +165,7 @@ public class PaperTradingService {
 
         PaperOrderState order = new PaperOrderState(LocalDate.now(), direction, snapshot.tickTime(),
                 snapshot.nifty(), entryPremium, entryStrike, reference);
-        long id = orderPersistenceService.insertOpen(order);
+        long id = orderPersistenceService.insertOpen(order, properties);
         order.id = id;
         openOrder = order;
         entryBullishStreak = 0;
@@ -151,13 +189,14 @@ public class PaperTradingService {
 
         boolean exitTrigger;
         if ("CE".equals(order.direction)) {
-            // CE bearish/divergence-reversal confirmation.
+            // CE exit: weaker (closer-to-neutral) reversal threshold than entry, so we exit as soon as the
+            // divergence starts fading rather than waiting for a full opposite-signal reversal.
             exitTrigger = anchoredCeDivergence != null && anchoredPeDivergence != null
-                    && anchoredCeDivergence < properties.getCeBearishThreshold() && anchoredPeDivergence > properties.getPeBearishThreshold();
+                    && (anchoredCeDivergence < properties.getCeExitThreshold() || anchoredPeDivergence > properties.getPeExitThreshold());
         } else {
-            // PE bullish/divergence-reversal confirmation.
+            // PE exit: mirror of the CE exit condition using the negated exit thresholds.
             exitTrigger = anchoredCeDivergence != null && anchoredPeDivergence != null
-                    && anchoredCeDivergence > properties.getCeBullishThreshold() && anchoredPeDivergence < properties.getPeBullishThreshold();
+                    && (anchoredCeDivergence > -properties.getCeExitThreshold() || anchoredPeDivergence < -properties.getPeExitThreshold());
         }
         exitStreak = exitTrigger ? exitStreak + 1 : 0;
 
@@ -207,6 +246,7 @@ public class PaperTradingService {
         log.info("Paper trade EXIT: id={} direction={} time={} exitPremium={} reason={} pnl={}",
                 order.id, order.direction, snapshot.tickTime(), exitPremium, reason, pnl);
         openOrder = null;
+        eventPublisher.publishEvent(new PaperTradeClosedEvent(order.id, order.direction, snapshot.tickTime()));
     }
 
     private Double asDouble(Object value) {

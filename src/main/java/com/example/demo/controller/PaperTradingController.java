@@ -2,6 +2,7 @@ package com.example.demo.controller;
 
 import com.example.demo.service.OrderSnapshotPersistenceService;
 import com.example.demo.service.PaperOrderPersistenceService;
+import com.example.demo.service.PaperOrderPersistenceService.PaperOrderSummary;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -30,7 +31,7 @@ public class PaperTradingController {
      * including today (default 1, i.e. today only), including its entry/exit prices, real divergence-based
      * exit reason/P&L, and the hypothetical (analysis-only) trailing-SL outcome for comparison. */
     @GetMapping("/api/paper-trading/orders")
-    public List<Map<String, Object>> getOrders(@RequestParam(name = "days", required = false) Integer days) {
+    public List<PaperOrderSummary> getOrders(@RequestParam(name = "days", required = false) Integer days) {
         LocalDate today = LocalDate.now();
         LocalDate from = (days == null || days <= 1) ? today : today.minusDays(days - 1L);
         return orderPersistenceService.getOrders(from, today);
