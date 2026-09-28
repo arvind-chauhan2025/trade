@@ -136,8 +136,8 @@ public class PaperTradingService {
     }
 
     private void handleEntry(TickSnapshot snapshot, Double ceDivergence30m, Double peDivergence30m) {
-        boolean fastCe = ceDivergence30m != null && ceDivergence30m > properties.getFastEntryDivergenceThreshold();
-        boolean fastPe = peDivergence30m != null && peDivergence30m > properties.getFastEntryDivergenceThreshold();
+        boolean fastCe = ceDivergence30m != null && ceDivergence30m >= properties.getFastEntryDivergenceThreshold();
+        boolean fastPe = peDivergence30m != null && peDivergence30m >= properties.getFastEntryDivergenceThreshold();
         fastEntryCeStreak = fastCe ? fastEntryCeStreak + 1 : 0;
         fastEntryPeStreak = fastPe ? fastEntryPeStreak + 1 : 0;
 
