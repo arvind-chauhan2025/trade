@@ -2,6 +2,8 @@ package com.example.demo.config;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
+import java.time.LocalTime;
+
 /**
  * Configuration for the automatic CE/PE paper-trading engine ({@code PaperTradingService}), which
  * enters/exits simulated (never sent to Angel One) trades from the existing FIXED ITM CE/PE 30-minute
@@ -25,6 +27,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * trading.paper.sl-percentage=30.0
  * trading.paper.direction-filter-enabled=true
  * trading.paper.direction-swing-candle-count=4
+ * trading.paper.entry-cutoff-time=14:50
+ * trading.paper.auto-close-time=15:14
  * </pre>
  */
 @ConfigurationProperties(prefix = "trading.paper")
@@ -111,6 +115,16 @@ public class PaperTradingProperties {
      * i.e. a 20-minute lookback window). Only fully completed candles are used; the still-forming candle
      * is never included. */
     private int directionSwingCandleCount = 4;
+
+    /** No new CE/PE entry is opened once the current tick's time is at or after this cutoff (default
+     * 14:50 / 2:50 PM); an already-open trade is unaffected and continues to be monitored/exited normally
+     * (see {@link #autoCloseTime}). */
+    private LocalTime entryCutoffTime = LocalTime.of(14, 50);
+
+    /** Hard end-of-day deadline (default 15:14 / 3:14 PM): if a trade is still open once the current
+     * tick's time reaches this value, it is force-closed at the current premium with
+     * {@code exitReason="AUTO_CLOSE_AT_MARKET"}, regardless of the divergence-based exit conditions. */
+    private LocalTime autoCloseTime = LocalTime.of(15, 14);
 
     public boolean isEnabled() {
         return enabled;
@@ -246,5 +260,21 @@ public class PaperTradingProperties {
 
     public void setDirectionSwingCandleCount(int directionSwingCandleCount) {
         this.directionSwingCandleCount = directionSwingCandleCount;
+    }
+
+    public LocalTime getEntryCutoffTime() {
+        return entryCutoffTime;
+    }
+
+    public void setEntryCutoffTime(LocalTime entryCutoffTime) {
+        this.entryCutoffTime = entryCutoffTime;
+    }
+
+    public LocalTime getAutoCloseTime() {
+        return autoCloseTime;
+    }
+
+    public void setAutoCloseTime(LocalTime autoCloseTime) {
+        this.autoCloseTime = autoCloseTime;
     }
 }

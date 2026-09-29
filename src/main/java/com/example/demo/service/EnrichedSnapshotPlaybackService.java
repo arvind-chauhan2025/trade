@@ -325,7 +325,12 @@ public class EnrichedSnapshotPlaybackService {
         Double peDivergence30m = num(row, "fixed_itm_pe_divergence30m");
 
         if (openBacktestPosition == null) {
-            backtestEntry(row, tickTime, ceDivergence30m, peDivergence30m);
+            if (tickTime.isBefore(paperTradingProperties.getEntryCutoffTime())) {
+                backtestEntry(row, tickTime, ceDivergence30m, peDivergence30m);
+            } else {
+                log.debug("Backtest: skipping entry checks, tickTime={} at/after entry cutoff={}",
+                        tickTime, paperTradingProperties.getEntryCutoffTime());
+            }
         } else {
             backtestExit(row, tickTime, ceDivergence30m, peDivergence30m);
         }
@@ -338,11 +343,11 @@ public class EnrichedSnapshotPlaybackService {
         fastEntryPeStreak = fastPe ? fastEntryPeStreak + 1 : 0;
 
         if (fastEntryCeStreak >= paperTradingProperties.getFastEntryConfirmationTicks()) {
-            tryOpenBacktestPosition("CE", row, tickTime, "FAST");
+            tryOpenBacktestPosition("CE", row, tickTime, "FAST", ceDivergence30m, peDivergence30m);
             return;
         }
         if (fastEntryPeStreak >= paperTradingProperties.getFastEntryConfirmationTicks()) {
-            tryOpenBacktestPosition("PE", row, tickTime, "FAST");
+            tryOpenBacktestPosition("PE", row, tickTime, "FAST", ceDivergence30m, peDivergence30m);
             return;
         }
 
@@ -363,9 +368,9 @@ public class EnrichedSnapshotPlaybackService {
         }
 
         if (entryBullishStreak >= paperTradingProperties.getConfirmationTicks()) {
-            tryOpenBacktestPosition("CE", row, tickTime, "REGULAR");
+            tryOpenBacktestPosition("CE", row, tickTime, "REGULAR", ceDivergence30m, peDivergence30m);
         } else if (entryBearishStreak >= paperTradingProperties.getConfirmationTicks()) {
-            tryOpenBacktestPosition("PE", row, tickTime, "REGULAR");
+            tryOpenBacktestPosition("PE", row, tickTime, "REGULAR", ceDivergence30m, peDivergence30m);
         }
     }
 
@@ -377,14 +382,15 @@ public class EnrichedSnapshotPlaybackService {
      * {@code nifty_candle_5m} candles up to {@code playingDate} (the date currently being replayed), never
      * the row's own tick data. Logs direction/swing values and whether the entry was allowed or blocked,
      * and resets the triggering streak(s) on a block so the condition must reconfirm. */
-    private void tryOpenBacktestPosition(String direction, Map<String, Object> row, LocalTime tickTime, String entryType) {
+    private void tryOpenBacktestPosition(String direction, Map<String, Object> row, LocalTime tickTime, String entryType,
+                                          Double ceDivergence30m, Double peDivergence30m) {
         if (!paperTradingProperties.isDirectionFilterEnabled()) {
-            openBacktestPosition(direction, row, tickTime, entryType, null);
+            openBacktestPosition(direction, row, tickTime, entryType, null, ceDivergence30m, peDivergence30m);
             return;
         }
 
         NiftyMarketDirectionService.MarketDirectionResult result =
-                marketDirectionService.determineDirection(playingDate, paperTradingProperties.getDirectionSwingCandleCount());
+                marketDirectionService.determineDirection(playingDate, paperTradingProperties.getDirectionSwingCandleCount(), tickTime);
         boolean allowed = "CE".equals(direction)
                 ? (result.isBullish() || result.isBullishReversal())
                 : (result.isBearish() || result.isBearishReversal());
@@ -410,7 +416,7 @@ public class EnrichedSnapshotPlaybackService {
                 direction, result.direction(), entryType, tickTime,
                 swingValue(result.previousSwingHigh()), swingValue(result.lastSwingHigh()),
                 swingValue(result.previousSwingLow()), swingValue(result.lastSwingLow()));
-        openBacktestPosition(direction, row, tickTime, entryType, result.direction().name());
+        openBacktestPosition(direction, row, tickTime, entryType, result.direction().name(), ceDivergence30m, peDivergence30m);
     }
 
     private static Double swingValue(NiftyMarketDirectionService.SwingPoint point) {
@@ -418,7 +424,7 @@ public class EnrichedSnapshotPlaybackService {
     }
 
     private void openBacktestPosition(String direction, Map<String, Object> row, LocalTime tickTime, String entryType,
-                                       String marketTrend) {
+                                       String marketTrend, Double entryCeDivergence30m, Double entryPeDivergence30m) {
         Double nifty = num(row, "nifty");
         Double entryPremium = "CE".equals(direction) ? num(row, "fixed_itm_ce") : num(row, "fixed_itm_pe");
         if (nifty == null || entryPremium == null) {
@@ -432,14 +438,16 @@ public class EnrichedSnapshotPlaybackService {
                 orZero(num(row, "fixed_itm_pe")), num(row, "fixed_itm_pe_strike"), num(row, "fixed_itm_pe_delta"),
                 num(row, "fixed_itm_pe_gamma30m"), num(row, "fixed_itm_pe_theta30m"));
 
-        openBacktestPosition = new BacktestPosition(direction, entryType, tickTime, nifty, entryPremium, reference, marketTrend);
+        openBacktestPosition = new BacktestPosition(direction, entryType, tickTime, nifty, entryPremium, reference,
+                marketTrend, entryCeDivergence30m, entryPeDivergence30m);
         entryBullishStreak = 0;
         entryBearishStreak = 0;
         exitStreak = 0;
         fastEntryCeStreak = 0;
         fastEntryPeStreak = 0;
-        log.info("Backtest ENTRY: direction={} entryType={} marketTrend={} time={} entryPremium={} nifty={}",
-                direction, entryType, marketTrend, tickTime, entryPremium, nifty);
+        log.info("Backtest ENTRY: direction={} entryType={} marketTrend={} time={} entryPremium={} nifty={} "
+                        + "entryCeDivergence30m={} entryPeDivergence30m={}",
+                direction, entryType, marketTrend, tickTime, entryPremium, nifty, entryCeDivergence30m, entryPeDivergence30m);
     }
 
     private void backtestExit(Map<String, Object> row, LocalTime tickTime, Double ceDivergence30m, Double peDivergence30m) {
@@ -448,6 +456,18 @@ public class EnrichedSnapshotPlaybackService {
         Double actualPremium = "CE".equals(order.direction) ? num(row, "fixed_itm_ce") : num(row, "fixed_itm_pe");
         if (actualPremium != null && actualPremium > order.highestPremium) {
             order.highestPremium = actualPremium;
+        }
+
+        // Hard end-of-day deadline: mirrors PaperTradingService.handleOpenOrder's force-close, so the
+        // backtest never leaves a trade open past paperTradingProperties.getAutoCloseTime() (default
+        // 15:14 / 3:14 PM), regardless of the divergence-based exit conditions below.
+        if (!tickTime.isBefore(paperTradingProperties.getAutoCloseTime())) {
+            if (actualPremium != null && nifty != null) {
+                closeBacktestPosition(tickTime, nifty, actualPremium, "AUTO_CLOSE_AT_MARKET", ceDivergence30m, peDivergence30m);
+            } else {
+                log.debug("Backtest: cannot auto-close at {}: premium/nifty not available yet", tickTime);
+            }
+            return;
         }
 
         // Reuses PremiumReferenceService's exact Taylor-expansion divergence math against this trade's
@@ -477,10 +497,10 @@ public class EnrichedSnapshotPlaybackService {
         boolean trailingExitTrigger = trailingExitApplicable && updateBacktestTrailingState(order, directionalDivergence);
 
         if (exitStreak >= paperTradingProperties.getConfirmationTicks() && actualPremium != null && nifty != null) {
-            closeBacktestPosition(tickTime, nifty, actualPremium, "DIVERGENCE_REVERSAL");
+            closeBacktestPosition(tickTime, nifty, actualPremium, "DIVERGENCE_REVERSAL", ceDivergence30m, peDivergence30m);
             exitStreak = 0;
         } else if (trailingExitTrigger && actualPremium != null && nifty != null) {
-            closeBacktestPosition(tickTime, nifty, actualPremium, "DIVERGENCE_TRAILING_RETRACEMENT");
+            closeBacktestPosition(tickTime, nifty, actualPremium, "DIVERGENCE_TRAILING_RETRACEMENT", ceDivergence30m, peDivergence30m);
         }
     }
 
@@ -507,13 +527,16 @@ public class EnrichedSnapshotPlaybackService {
                 && (order.peakDivergence - currentDivergence) >= retracement;
     }
 
-    private void closeBacktestPosition(LocalTime exitTime, double exitNifty, double exitPremium, String reason) {
+    private void closeBacktestPosition(LocalTime exitTime, double exitNifty, double exitPremium, String reason,
+                                        Double exitCeDivergence30m, Double exitPeDivergence30m) {
         BacktestPosition order = openBacktestPosition;
         double pnl = exitPremium - order.entryPremium;
         completedTrades.add(new BacktestTrade(order.direction, order.entryTime, order.entryNifty, order.entryPremium,
-                order.entryType, order.marketTrend, exitTime, exitNifty, exitPremium, reason, pnl));
-        log.info("Backtest EXIT: direction={} entryTime={} exitTime={} exitPremium={} reason={} pnl={}",
-                order.direction, order.entryTime, exitTime, exitPremium, reason, pnl);
+                order.entryType, order.marketTrend, order.entryCeDivergence30m, order.entryPeDivergence30m,
+                exitTime, exitNifty, exitPremium, reason, exitCeDivergence30m, exitPeDivergence30m, pnl));
+        log.info("Backtest EXIT: direction={} entryTime={} exitTime={} exitPremium={} reason={} pnl={} "
+                        + "exitCeDivergence30m={} exitPeDivergence30m={}",
+                order.direction, order.entryTime, exitTime, exitPremium, reason, pnl, exitCeDivergence30m, exitPeDivergence30m);
         openBacktestPosition = null;
     }
 
@@ -538,11 +561,16 @@ public class EnrichedSnapshotPlaybackService {
     /** One simulated CE/PE trade recorded by the backtest engine. {@code exitTime}/{@code exitNifty}/
      * {@code exitPremium}/{@code pnl} are {@code null} when {@code exitReason} is {@code "OPEN_AT_END"}
      * (playback stopped/finished while this trade was still open). {@code marketTrend} is the 20-minute
-     * NIFTY market-direction filter's verdict ({@code "BULLISH"}/{@code "BEARISH"}) at entry time, or
-     * {@code null} when the filter was disabled. */
+     * NIFTY market-direction filter's verdict ({@code "BULLISH"}/{@code "BEARISH"}/{@code "REVERSAL_CANDIDATE"})
+     * at entry time, or {@code null} when the filter was disabled. {@code entryCeDivergence30m}/
+     * {@code entryPeDivergence30m} are the shared rolling 30-minute CE/PE divergence values at entry time,
+     * and {@code exitCeDivergence30m}/{@code exitPeDivergence30m} the same at exit time (both {@code null}
+     * for an {@code "OPEN_AT_END"} trade) — recorded purely for backtest-result review, alongside (not
+     * instead of) the order-anchored divergence math that actually drives the exit decision. */
     public record BacktestTrade(String direction, LocalTime entryTime, double entryNifty, double entryPremium,
-                                 String entryType, String marketTrend, LocalTime exitTime, Double exitNifty,
-                                 Double exitPremium, String exitReason, Double pnl) {
+                                 String entryType, String marketTrend, Double entryCeDivergence30m, Double entryPeDivergence30m,
+                                 LocalTime exitTime, Double exitNifty, Double exitPremium, String exitReason,
+                                 Double exitCeDivergence30m, Double exitPeDivergence30m, Double pnl) {
     }
 
     /** Mutable in-progress simulated position, mirroring the fields {@code PaperTradingService}'s
@@ -555,13 +583,16 @@ public class EnrichedSnapshotPlaybackService {
         final double entryPremium;
         final PremiumReferenceService.FixedItmOrderReference reference;
         final String marketTrend;
+        final Double entryCeDivergence30m;
+        final Double entryPeDivergence30m;
         double highestPremium;
         Double peakDivergence;
         Double previousDivergence;
         int trailingFallStreak;
 
         BacktestPosition(String direction, String entryType, LocalTime entryTime, double entryNifty, double entryPremium,
-                          PremiumReferenceService.FixedItmOrderReference reference, String marketTrend) {
+                          PremiumReferenceService.FixedItmOrderReference reference, String marketTrend,
+                          Double entryCeDivergence30m, Double entryPeDivergence30m) {
             this.direction = direction;
             this.entryType = entryType;
             this.entryTime = entryTime;
@@ -569,12 +600,14 @@ public class EnrichedSnapshotPlaybackService {
             this.entryPremium = entryPremium;
             this.reference = reference;
             this.marketTrend = marketTrend;
+            this.entryCeDivergence30m = entryCeDivergence30m;
+            this.entryPeDivergence30m = entryPeDivergence30m;
             this.highestPremium = entryPremium;
         }
 
         BacktestTrade toOpenAtEndTrade() {
             return new BacktestTrade(direction, entryTime, entryNifty, entryPremium, entryType, marketTrend,
-                    null, null, null, "OPEN_AT_END", null);
+                    entryCeDivergence30m, entryPeDivergence30m, null, null, null, "OPEN_AT_END", null, null, null);
         }
     }
 

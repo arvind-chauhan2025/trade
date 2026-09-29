@@ -138,6 +138,21 @@ public class NiftyCandleService {
                 tradeDate);
     }
 
+    /** Returns every completed 5-minute candle for {@code tradeDate} whose bucket had already fully
+     * elapsed by {@code asOfTime} (i.e. {@code intervalStart + 5 minutes <= asOfTime}), ordered
+     * chronologically. Unlike {@link #getCandles(LocalDate)}, which returns every candle persisted for
+     * the whole day regardless of caller context, this exists for {@link NiftyMarketDirectionService}
+     * during historical playback: {@code EnrichedSnapshotPlaybackService} replays a day whose candles are
+     * <b>all already persisted</b> in {@code nifty_candle_5m}, so calling {@code getCandles(tradeDate)}
+     * there would leak candles from later in the same session into the direction filter (look-ahead
+     * bias) — this method restricts the result to only what would genuinely have been available at
+     * {@code asOfTime}. */
+    public List<NiftyCandle> getCandlesUpTo(LocalDate tradeDate, LocalTime asOfTime) {
+        return getCandles(tradeDate).stream()
+                .filter(candle -> !candle.intervalStart().plusMinutes(INTERVAL_MINUTES).isAfter(asOfTime))
+                .toList();
+    }
+
     /** Returns every completed 5-minute candle persisted for any trade date in {@code [fromDate, toDate]}
      * (inclusive on both ends), ordered chronologically (date, then interval). */
     public List<NiftyCandle> getCandles(LocalDate fromDate, LocalDate toDate) {

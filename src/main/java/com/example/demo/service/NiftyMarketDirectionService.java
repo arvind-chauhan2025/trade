@@ -94,16 +94,31 @@ public class NiftyMarketDirectionService {
     }
 
     /** Determines the current NIFTY market structure for {@code tradeDate} using a {@code candleCount}
-     * (default 4 -> ~20-minute) latest-candle context window. Always logs the resulting direction and the
-     * swing high/low values it was derived from. */
+     * (default 4 -> ~20-minute) latest-candle context window, considering every candle persisted for the
+     * day. Only safe to call live (where "every persisted candle" and "every candle available so far"
+     * are the same thing); for historical playback use
+     * {@link #determineDirection(LocalDate, int, LocalTime)} instead to avoid look-ahead. Always logs the
+     * resulting direction and the swing high/low values it was derived from. */
     public MarketDirectionResult determineDirection(LocalDate tradeDate, int candleCount) {
+        return determineDirection(tradeDate, candleCount, LocalTime.MAX);
+    }
+
+    /** Same as {@link #determineDirection(LocalDate, int)}, but restricted to candles whose 5-minute
+     * bucket had already fully elapsed by {@code asOfTime} — i.e. only candles that would genuinely have
+     * been available at that point in time. Essential during historical playback
+     * ({@code EnrichedSnapshotPlaybackService}), where every candle for the whole {@code tradeDate} is
+     * already persisted in {@code nifty_candle_5m} up front: without this restriction the direction
+     * filter would "see" candles from later in the same session than the tick currently being replayed
+     * (look-ahead bias), which never happens live since a candle only exists once its bucket genuinely
+     * completes. */
+    public MarketDirectionResult determineDirection(LocalDate tradeDate, int candleCount, LocalTime asOfTime) {
         if (candleCount < 3) {
             throw new IllegalArgumentException("candleCount must be at least 3");
         }
 
-        List<NiftyCandle> completed = niftyCandleService.getCandles(tradeDate);
+        List<NiftyCandle> completed = niftyCandleService.getCandlesUpTo(tradeDate, asOfTime);
         if (completed == null || completed.isEmpty()) {
-            log.info("Market direction: no completed 5m candles for {} -> NEUTRAL", tradeDate);
+            log.info("Market direction: no completed 5m candles for {} as of {} -> NEUTRAL", tradeDate, asOfTime);
             return neutralResult(candleCount, 0, "No completed 5-minute candles");
         }
 

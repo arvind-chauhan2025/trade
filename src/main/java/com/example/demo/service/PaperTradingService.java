@@ -132,7 +132,12 @@ public class PaperTradingService {
         Double peDivergence30m = asDouble(enriched.get("fixedItmPeDivergence30m"));
 
         if (openOrder == null) {
-            handleEntry(snapshot, ceDivergence30m, peDivergence30m);
+            if (snapshot.tickTime().isBefore(properties.getEntryCutoffTime())) {
+                handleEntry(snapshot, ceDivergence30m, peDivergence30m);
+            } else {
+                log.debug("Skipping entry checks: tickTime={} at/after entry cutoff={}",
+                        snapshot.tickTime(), properties.getEntryCutoffTime());
+            }
         } else {
             handleOpenOrder(snapshot, ceDivergence30m, peDivergence30m);
         }
@@ -197,7 +202,7 @@ public class PaperTradingService {
         }
 
         NiftyMarketDirectionService.MarketDirectionResult result =
-                marketDirectionService.determineDirection(LocalDate.now(), properties.getDirectionSwingCandleCount());
+                marketDirectionService.determineDirection(LocalDate.now(), properties.getDirectionSwingCandleCount(), snapshot.tickTime());
         boolean allowed = "CE".equals(direction)
                 ? (result.isBullish() || result.isBullishReversal())
                 : (result.isBearish() || result.isBearishReversal());
@@ -259,6 +264,23 @@ public class PaperTradingService {
     private void handleOpenOrder(TickSnapshot snapshot, Double ceDivergence30m, Double peDivergence30m) {
         PaperOrderState order = openOrder;
         Double actualPremium = "CE".equals(order.direction) ? snapshot.fixedItmCe() : snapshot.fixedItmPe();
+
+        // Hard end-of-day deadline: force-close regardless of the divergence-based exit conditions once
+        // the tick time reaches properties.getAutoCloseTime() (default 15:14 / 3:14 PM). Entries are
+        // already blocked past properties.getEntryCutoffTime() (default 14:50 / 2:50 PM) in onSnapshot(),
+        // but a trade opened before that cutoff must still be flattened by the auto-close deadline.
+        if (!snapshot.tickTime().isBefore(properties.getAutoCloseTime())) {
+            if (actualPremium != null && snapshot.nifty() != null) {
+                closePosition(order, snapshot, actualPremium, "AUTO_CLOSE_AT_MARKET");
+                snapshotPersistenceService.insert(order.id, order.tradeDate, snapshot.tickTime(), snapshot.nifty(),
+                        snapshot.fixedItmCe(), snapshot.fixedItmPe(), ceDivergence30m, peDivergence30m,
+                        null, null, "EXIT_AUTO_CLOSE");
+            } else {
+                log.warn("Cannot auto-close paper trade id={} at {}: premium/nifty snapshot not fully populated yet",
+                        order.id, snapshot.tickTime());
+            }
+            return;
+        }
 
         String event = trackHypotheticalStopLoss(order, actualPremium, snapshot);
 
