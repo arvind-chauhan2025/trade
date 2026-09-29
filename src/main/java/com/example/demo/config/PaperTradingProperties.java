@@ -19,9 +19,12 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * trading.paper.ce-divergence-trailing-retracement=1.0
  * trading.paper.pe-divergence-trailing-retracement=1.0
  * trading.paper.divergence-trailing-confirmation-count=2
+ * trading.paper.divergence-trailing-exit-fast-entry-only=false
  * trading.paper.fast-entry-divergence-threshold=8.0
  * trading.paper.fast-entry-confirmation-ticks=2
  * trading.paper.sl-percentage=30.0
+ * trading.paper.direction-filter-enabled=true
+ * trading.paper.direction-swing-candle-count=4
  * </pre>
  */
 @ConfigurationProperties(prefix = "trading.paper")
@@ -75,6 +78,14 @@ public class PaperTradingProperties {
      * Default 2. */
     private int divergenceTrailingConfirmationCount = 2;
 
+    /** When {@code true}, the divergence-trailing exit ({@link #ceDivergenceTrailingRetracement}/
+     * {@link #peDivergenceTrailingRetracement}/{@link #divergenceTrailingConfirmationCount}) is only
+     * evaluated for trades whose {@code entryType} is {@code "FAST"} (see
+     * {@link #fastEntryDivergenceThreshold}); {@code "REGULAR"} trades then rely solely on the plain
+     * {@link #ceExitThreshold}/{@link #peExitThreshold} reversal exit. When {@code false} (default), the
+     * trailing exit applies to every open trade regardless of how it was entered. */
+    private boolean divergenceTrailingExitFastEntryOnly = true;
+
     /** Fast entry: when {@code fixedItmCeDivergence30m} or {@code fixedItmPeDivergence30m} alone (not
      * the paired bullish/bearish condition) exceeds this value, a CE (for CE divergence) or PE (for PE
      * divergence) trade is opened after only {@link #fastEntryConfirmationTicks} consecutive snapshots
@@ -89,6 +100,17 @@ public class PaperTradingProperties {
     /** Hypothetical (analysis-only) trailing stop-loss, as a percentage drop from the highest premium
      * observed since entry. Never triggers a real exit or Angel One order. Default 30%. */
     private double slPercentage = 10.0;
+
+    /** Master switch for the 20-minute NIFTY market-direction filter (swing HH/HL for BULLISH, LH/LL for
+     * BEARISH, otherwise NEUTRAL/UNCLEAR). When {@code true} (default), a CE entry is only allowed while
+     * the filter reports BULLISH and a PE entry only while it reports BEARISH; NEUTRAL/UNCLEAR blocks
+     * both. When {@code false}, entries are gated purely by the existing divergence conditions. */
+    private boolean directionFilterEnabled = true;
+
+    /** Number of latest completed 5-minute NIFTY candles examined by the direction filter (default 4,
+     * i.e. a 20-minute lookback window). Only fully completed candles are used; the still-forming candle
+     * is never included. */
+    private int directionSwingCandleCount = 4;
 
     public boolean isEnabled() {
         return enabled;
@@ -178,6 +200,14 @@ public class PaperTradingProperties {
         this.divergenceTrailingConfirmationCount = divergenceTrailingConfirmationCount;
     }
 
+    public boolean isDivergenceTrailingExitFastEntryOnly() {
+        return divergenceTrailingExitFastEntryOnly;
+    }
+
+    public void setDivergenceTrailingExitFastEntryOnly(boolean divergenceTrailingExitFastEntryOnly) {
+        this.divergenceTrailingExitFastEntryOnly = divergenceTrailingExitFastEntryOnly;
+    }
+
     public double getFastEntryDivergenceThreshold() {
         return fastEntryDivergenceThreshold;
     }
@@ -200,5 +230,21 @@ public class PaperTradingProperties {
 
     public void setSlPercentage(double slPercentage) {
         this.slPercentage = slPercentage;
+    }
+
+    public boolean isDirectionFilterEnabled() {
+        return directionFilterEnabled;
+    }
+
+    public void setDirectionFilterEnabled(boolean directionFilterEnabled) {
+        this.directionFilterEnabled = directionFilterEnabled;
+    }
+
+    public int getDirectionSwingCandleCount() {
+        return directionSwingCandleCount;
+    }
+
+    public void setDirectionSwingCandleCount(int directionSwingCandleCount) {
+        this.directionSwingCandleCount = directionSwingCandleCount;
     }
 }

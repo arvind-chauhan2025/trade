@@ -23,6 +23,11 @@ class PaperOrderState {
      * {@link com.example.demo.config.PaperTradingProperties#getFastEntryDivergenceThreshold()}) or
      * {@code "REGULAR"} (the normal paired bullish/bearish confirmation). */
     final String entryType;
+    /** The 20-minute NIFTY market-direction filter's verdict ({@code "BULLISH"}, {@code "BEARISH"} or
+     * {@code "NEUTRAL"}) at entry time, from {@link NiftyMarketDirectionService}. Stored for auditing;
+     * always agrees with {@code direction} (CE only opens on BULLISH, PE only on BEARISH) whenever the
+     * filter is enabled, and is {@code null} when the filter is disabled. */
+    final String marketTrend;
 
     /** Highest premium observed since entry; drives the hypothetical trailing SL, analysis-only. */
     double highestPremium;
@@ -44,7 +49,7 @@ class PaperOrderState {
 
     PaperOrderState(LocalDate tradeDate, String direction, LocalTime entryTime, double entryNifty,
                      double entryPremium, Double entryStrike, PremiumReferenceService.FixedItmOrderReference reference,
-                     String entryType) {
+                     String entryType, String marketTrend) {
         this.tradeDate = tradeDate;
         this.direction = direction;
         this.entryTime = entryTime;
@@ -53,6 +58,7 @@ class PaperOrderState {
         this.entryStrike = entryStrike;
         this.reference = reference;
         this.entryType = entryType;
+        this.marketTrend = marketTrend;
         this.highestPremium = entryPremium;
     }
 }

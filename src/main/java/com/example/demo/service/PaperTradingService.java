@@ -59,6 +59,7 @@ public class PaperTradingService {
     private final PremiumReferenceService premiumReferenceService;
     private final PaperOrderPersistenceService orderPersistenceService;
     private final OrderSnapshotPersistenceService snapshotPersistenceService;
+    private final NiftyMarketDirectionService marketDirectionService;
     private final PaperTradingProperties properties;
     private final ApplicationEventPublisher eventPublisher;
 
@@ -76,11 +77,13 @@ public class PaperTradingService {
     public PaperTradingService(PremiumReferenceService premiumReferenceService,
                                 PaperOrderPersistenceService orderPersistenceService,
                                 OrderSnapshotPersistenceService snapshotPersistenceService,
+                                NiftyMarketDirectionService marketDirectionService,
                                 PaperTradingProperties properties,
                                 ApplicationEventPublisher eventPublisher) {
         this.premiumReferenceService = premiumReferenceService;
         this.orderPersistenceService = orderPersistenceService;
         this.snapshotPersistenceService = snapshotPersistenceService;
+        this.marketDirectionService = marketDirectionService;
         this.properties = properties;
         this.eventPublisher = eventPublisher;
     }
@@ -142,11 +145,11 @@ public class PaperTradingService {
         fastEntryPeStreak = fastPe ? fastEntryPeStreak + 1 : 0;
 
         if (fastEntryCeStreak >= properties.getFastEntryConfirmationTicks()) {
-            openPosition("CE", snapshot, ceDivergence30m, peDivergence30m, "FAST");
+            tryOpenPosition("CE", snapshot, ceDivergence30m, peDivergence30m, "FAST");
             return;
         }
         if (fastEntryPeStreak >= properties.getFastEntryConfirmationTicks()) {
-            openPosition("PE", snapshot, ceDivergence30m, peDivergence30m, "FAST");
+            tryOpenPosition("PE", snapshot, ceDivergence30m, peDivergence30m, "FAST");
             return;
         }
 
@@ -167,14 +170,67 @@ public class PaperTradingService {
         }
 
         if (entryBullishStreak >= properties.getConfirmationTicks()) {
-            openPosition("CE", snapshot, ceDivergence30m, peDivergence30m, "REGULAR");
+            tryOpenPosition("CE", snapshot, ceDivergence30m, peDivergence30m, "REGULAR");
         } else if (entryBearishStreak >= properties.getConfirmationTicks()) {
-            openPosition("PE", snapshot, ceDivergence30m, peDivergence30m, "REGULAR");
+            tryOpenPosition("PE", snapshot, ceDivergence30m, peDivergence30m, "REGULAR");
         }
     }
 
+    /** Applies the NIFTY market-structure context filter (a separate, additional gate alongside the
+     * existing divergence-based entry conditions already confirmed by the caller): a CE entry is allowed
+     * while {@link NiftyMarketDirectionService} reports {@code BULLISH} structure (Higher-High +
+     * Higher-Low) <i>or</i> a bullish {@code REVERSAL_CANDIDATE} (Lower-High + Higher-Low — divergence can
+     * flip before a full bullish structure has re-formed), and a PE entry is allowed while it reports
+     * {@code BEARISH} structure (Lower-High + Lower-Low) or a bearish {@code REVERSAL_CANDIDATE}
+     * (Higher-High + Lower-Low). Plain {@code NEUTRAL} blocks both. When
+     * {@link PaperTradingProperties#isDirectionFilterEnabled()} is {@code false} the filter is skipped
+     * entirely and the entry proceeds purely on the divergence conditions, as before. Always logs the
+     * direction, the swing high/low values it was derived from, and whether the entry was allowed or
+     * blocked. A blocked entry resets the streak(s) that triggered it, so the divergence condition must
+     * reconfirm from scratch rather than firing again on the very next tick while structure is still
+     * unfavorable. */
+    private void tryOpenPosition(String direction, TickSnapshot snapshot, Double ceDivergence30m, Double peDivergence30m,
+                                  String entryType) {
+        if (!properties.isDirectionFilterEnabled()) {
+            openPosition(direction, snapshot, ceDivergence30m, peDivergence30m, entryType, null);
+            return;
+        }
+
+        NiftyMarketDirectionService.MarketDirectionResult result =
+                marketDirectionService.determineDirection(LocalDate.now(), properties.getDirectionSwingCandleCount());
+        boolean allowed = "CE".equals(direction)
+                ? (result.isBullish() || result.isBullishReversal())
+                : (result.isBearish() || result.isBearishReversal());
+
+        if (!allowed) {
+            log.info("{} entry BLOCKED by market-direction filter: requiredDirection={} actualDirection={} "
+                            + "entryType={} swingHigh={}->{} swingLow={}->{} reason={}",
+                    direction, "CE".equals(direction) ? "BULLISH" : "BEARISH", result.direction(), entryType,
+                    swingValue(result.previousSwingHigh()), swingValue(result.lastSwingHigh()),
+                    swingValue(result.previousSwingLow()), swingValue(result.lastSwingLow()), result.reason());
+            if ("CE".equals(direction)) {
+                entryBullishStreak = 0;
+                fastEntryCeStreak = 0;
+            } else {
+                entryBearishStreak = 0;
+                fastEntryPeStreak = 0;
+            }
+            return;
+        }
+
+        log.info("{} entry ALLOWED by market-direction filter: direction={} entryType={} swingHigh={}->{} swingLow={}->{}",
+                direction, result.direction(), entryType,
+                swingValue(result.previousSwingHigh()), swingValue(result.lastSwingHigh()),
+                swingValue(result.previousSwingLow()), swingValue(result.lastSwingLow()));
+        openPosition(direction, snapshot, ceDivergence30m, peDivergence30m, entryType, result.direction().name());
+    }
+
+    private static Double swingValue(NiftyMarketDirectionService.SwingPoint point) {
+        return point != null ? point.value() : null;
+    }
+
     private void openPosition(String direction, TickSnapshot snapshot, Double ceDivergence30m, Double peDivergence30m,
-                               String entryType) {
+                               String entryType, String marketTrend) {
         Double entryPremium = "CE".equals(direction) ? snapshot.fixedItmCe() : snapshot.fixedItmPe();
         Double entryStrike = "CE".equals(direction) ? snapshot.fixedItmCeStrike() : snapshot.fixedItmPeStrike();
         PremiumReferenceService.FixedItmOrderReference reference = premiumReferenceService.captureFixedItmOrderReference(snapshot);
@@ -184,7 +240,7 @@ public class PaperTradingService {
         }
 
         PaperOrderState order = new PaperOrderState(LocalDate.now(), direction, snapshot.tickTime(),
-                snapshot.nifty(), entryPremium, entryStrike, reference, entryType);
+                snapshot.nifty(), entryPremium, entryStrike, reference, entryType, marketTrend);
         long id = orderPersistenceService.insertOpen(order, properties);
         order.id = id;
         openOrder = order;
@@ -223,7 +279,8 @@ public class PaperTradingService {
         exitStreak = exitTrigger ? exitStreak + 1 : 0;
 
         Double directionalDivergence = "CE".equals(order.direction) ? anchoredCeDivergence : anchoredPeDivergence;
-        boolean trailingExitTrigger = updateDivergenceTrailingState(order, directionalDivergence);
+        boolean trailingExitApplicable = !properties.isDivergenceTrailingExitFastEntryOnly() || "FAST".equals(order.entryType);
+        boolean trailingExitTrigger = trailingExitApplicable && updateDivergenceTrailingState(order, directionalDivergence);
 
         if (exitStreak >= properties.getConfirmationTicks() && actualPremium != null && snapshot.nifty() != null) {
             closePosition(order, snapshot, actualPremium, "DIVERGENCE_REVERSAL");
@@ -247,7 +304,11 @@ public class PaperTradingService {
      * consecutive falling ticks and a retracement from the peak of at least
      * {@link PaperTradingProperties#getCeDivergenceTrailingRetracement()} (CE trade) or
      * {@link PaperTradingProperties#getPeDivergenceTrailingRetracement()} (PE trade) have been observed —
-     * evaluated every tick alongside (never replacing) the existing plain divergence-reversal exit above. */
+     * evaluated every tick alongside (never replacing) the existing plain divergence-reversal exit above.
+     * Only called by the caller when {@link PaperTradingProperties#isDivergenceTrailingExitFastEntryOnly()}
+     * is {@code false} or {@code order.entryType} is {@code "FAST"}; otherwise the caller skips calling
+     * this entirely so peak/streak state is never tracked (and this exit never fires) for a REGULAR trade
+     * when scoped to FAST-only. */
     private boolean updateDivergenceTrailingState(PaperOrderState order, Double currentDivergence) {
         if (currentDivergence == null) {
             return false;
