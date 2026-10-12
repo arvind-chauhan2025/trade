@@ -107,7 +107,7 @@ public class TickSnapshotBroadcastService {
 
         Map<String, Object> enriched = premiumReferenceService.enrich(snapshot);
         enrichedSnapshotPersistenceService.offer(enriched);
-        paperTradingService.onSnapshot(snapshot, enriched);
+        //paperTradingService.onSnapshot(snapshot, enriched);
 
         if (webSocketHandler.getSessions().isEmpty()) {
             return;

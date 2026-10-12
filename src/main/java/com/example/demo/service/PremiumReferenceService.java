@@ -261,6 +261,7 @@ public class PremiumReferenceService {
         }
         rollingReference = captureReferenceData(snapshot);
         rollingReferenceDate = LocalDate.now();
+        resetAtmItmFlag.set(true);
         persist(ROLLING_REF_TYPE, rollingReferenceDate, rollingReference);
         log.info("Manually refreshed 30-min rolling reference at {}: nifty={}, atmCe={}, atmPe={}, fixedItmCe={}, fixedItmPe={}",
                 snapshot.tickTime(), snapshot.nifty(), snapshot.atmCe(), snapshot.atmPe(), snapshot.fixedItmCe(), snapshot.fixedItmPe());

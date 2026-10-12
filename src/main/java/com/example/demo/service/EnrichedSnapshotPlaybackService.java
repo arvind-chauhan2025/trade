@@ -1,3 +1,4 @@
+/*
 package com.example.demo.service;
 
 import com.example.demo.config.PaperTradingProperties;
@@ -25,6 +26,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
+*/
 /**
  * Replays already-persisted {@code enriched_snapshot} rows for a chosen trade date back over the same
  * {@code /ws/tick-snapshot} WebSocket that {@link TickSnapshotBroadcastService} normally feeds live, so a
@@ -50,12 +52,15 @@ import java.util.concurrent.TimeUnit;
  * <p>
  * Only one playback (and, if enabled, backtest) can run at a time; starting a new one stops whatever was
  * already in progress.
- */
+ *//*
+
 @Service
 public class EnrichedSnapshotPlaybackService {
     private static final Logger log = LoggerFactory.getLogger(EnrichedSnapshotPlaybackService.class);
-    /** Row-to-row pacing is clamped to this range so a data gap (e.g. lunch lull) doesn't stall playback
-     * for minutes, and a suspiciously-tiny/zero gap still results in a visible, distinct WebSocket message. */
+    */
+/** Row-to-row pacing is clamped to this range so a data gap (e.g. lunch lull) doesn't stall playback
+     * for minutes, and a suspiciously-tiny/zero gap still results in a visible, distinct WebSocket message. *//*
+
     private static final Duration MIN_STEP_DELAY = Duration.ofMillis(50);
     private static final Duration MAX_STEP_DELAY = Duration.ofSeconds(5);
 
@@ -101,18 +106,22 @@ public class EnrichedSnapshotPlaybackService {
         this.marketDirectionService = marketDirectionService;
     }
 
-    /** Same as {@link #start(LocalDate, double, boolean)} with {@code backtest=false}. */
+    */
+/** Same as {@link #start(LocalDate, double, boolean)} with {@code backtest=false}. *//*
+
     public int start(LocalDate date, double speed) {
         return start(date, speed, false);
     }
 
-    /** Starts replaying {@code date}'s persisted enriched snapshots from the beginning, at {@code speed}x
+    */
+/** Starts replaying {@code date}'s persisted enriched snapshots from the beginning, at {@code speed}x
      * the original pace (must be {@code > 0}; {@code 1.0} = original pace). Stops any playback already in
      * progress first. When {@code backtest} is {@code true}, also resets and re-runs the in-memory
      * paper-trading simulation described in the class doc alongside the replay; its results are available
      * via {@link #lastBacktestTrades()} once playback finishes (or at any point mid-playback, for trades
      * closed so far). Returns the number of rows queued for replay (0 if none were persisted for that
-     * date, in which case nothing is scheduled). */
+     * date, in which case nothing is scheduled). *//*
+
     public int start(LocalDate date, double speed, boolean backtest) {
         if (date == null) {
             throw new IllegalArgumentException("date must not be null");
@@ -143,8 +152,10 @@ public class EnrichedSnapshotPlaybackService {
         }
     }
 
-    /** Stops the current playback (if any) immediately; the next {@link #start} begins a fresh replay
-     * from the first row. No-op if nothing is currently playing. */
+    */
+/** Stops the current playback (if any) immediately; the next {@link #start} begins a fresh replay
+     * from the first row. No-op if nothing is currently playing. *//*
+
     public void stop() {
         synchronized (lock) {
             stopLocked();
@@ -177,23 +188,29 @@ public class EnrichedSnapshotPlaybackService {
         completedTrades = new ArrayList<>();
     }
 
-    /** {@code true} while a playback is actively scheduled/in-progress. */
+    */
+/** {@code true} while a playback is actively scheduled/in-progress. *//*
+
     public boolean isRunning() {
         synchronized (lock) {
             return rows != null;
         }
     }
 
-    /** The date currently being replayed, or {@code null} if no playback is running. */
+    */
+/** The date currently being replayed, or {@code null} if no playback is running. *//*
+
     public LocalDate playingDate() {
         synchronized (lock) {
             return playingDate;
         }
     }
 
-    /** Sends the row at {@code nextIndex}, then schedules the following row after a delay derived from
+    */
+/** Sends the row at {@code nextIndex}, then schedules the following row after a delay derived from
      * the recorded gap between the two rows' {@code tickDateTime} (scaled by {@link #speed}, clamped to
-     * {@link #MIN_STEP_DELAY}/{@link #MAX_STEP_DELAY}). Stops itself once the last row has been sent. */
+     * {@link #MIN_STEP_DELAY}/{@link #MAX_STEP_DELAY}). Stops itself once the last row has been sent. *//*
+
     private void step() {
         Map<String, Object> row;
         Duration untilNext = null;
@@ -246,10 +263,12 @@ public class EnrichedSnapshotPlaybackService {
         return raw;
     }
 
-    /** Converts one persisted row (snake_case DB columns) back into the same camelCase shape
+    */
+/** Converts one persisted row (snake_case DB columns) back into the same camelCase shape
      * {@link PremiumReferenceService#enrich} originally produced, and pushes it to every open
      * {@code /ws/tick-snapshot} session, same as a live broadcast cycle. No-op (skips serialization) if no
-     * client is currently connected. */
+     * client is currently connected. *//*
+
     private void broadcast(Map<String, Object> row) {
         if (webSocketHandler.getSessions().isEmpty()) {
             return;
@@ -283,8 +302,10 @@ public class EnrichedSnapshotPlaybackService {
         }
     }
 
-    /** Reverses {@code EnrichedSnapshotPersistenceService.toSnakeCase}: {@code "atm_ce_divergence30m"} ->
-     * {@code "atmCeDivergence30m"}. */
+    */
+/** Reverses {@code EnrichedSnapshotPersistenceService.toSnakeCase}: {@code "atm_ce_divergence30m"} ->
+     * {@code "atmCeDivergence30m"}. *//*
+
     private static String toCamelCase(String snakeCase) {
         String[] parts = snakeCase.split("_");
         StringBuilder result = new StringBuilder(parts[0]);
@@ -297,17 +318,21 @@ public class EnrichedSnapshotPlaybackService {
         return result.toString();
     }
 
-    /** {@code true} if the currently (or most recently) started playback had {@code backtest=true}. */
+    */
+/** {@code true} if the currently (or most recently) started playback had {@code backtest=true}. *//*
+
     public boolean isBacktestEnabled() {
         synchronized (lock) {
             return backtestEnabled;
         }
     }
 
-    /** Simulated trades recorded so far by the current/last backtest run (see the class doc), oldest
+    */
+/** Simulated trades recorded so far by the current/last backtest run (see the class doc), oldest
      * first. A trade still open when playback stopped/finished is included with {@code exitTime}/
      * {@code exitPremium} {@code null} and {@code exitReason="OPEN_AT_END"}. Empty if no backtest has run
-     * yet, or the last {@link #start} had {@code backtest=false}. */
+     * yet, or the last {@link #start} had {@code backtest=false}. *//*
+
     public List<BacktestTrade> lastBacktestTrades() {
         synchronized (lock) {
             return List.copyOf(completedTrades);
@@ -374,14 +399,16 @@ public class EnrichedSnapshotPlaybackService {
         }
     }
 
-    /** Mirrors {@code PaperTradingService.tryOpenPosition}: applies the same 20-minute NIFTY
+    */
+/** Mirrors {@code PaperTradingService.tryOpenPosition}: applies the same 20-minute NIFTY
      * market-direction filter (separate gate alongside the divergence conditions already confirmed by
      * {@link #backtestEntry}) so the backtest faithfully reproduces the live entry rules — a CE entry
      * additionally requires {@code BULLISH} swing structure, a PE entry additionally requires
      * {@code BEARISH} swing structure, and the direction is derived from completed
      * {@code nifty_candle_5m} candles up to {@code playingDate} (the date currently being replayed), never
      * the row's own tick data. Logs direction/swing values and whether the entry was allowed or blocked,
-     * and resets the triggering streak(s) on a block so the condition must reconfirm. */
+     * and resets the triggering streak(s) on a block so the condition must reconfirm. *//*
+
     private void tryOpenBacktestPosition(String direction, Map<String, Object> row, LocalTime tickTime, String entryType,
                                           Double ceDivergence30m, Double peDivergence30m) {
         if (!paperTradingProperties.isDirectionFilterEnabled()) {
@@ -504,7 +531,9 @@ public class EnrichedSnapshotPlaybackService {
         }
     }
 
-    /** Mirrors {@code PaperTradingService.updateDivergenceTrailingState}. */
+    */
+/** Mirrors {@code PaperTradingService.updateDivergenceTrailingState}. *//*
+
     private boolean updateBacktestTrailingState(BacktestPosition order, Double currentDivergence) {
         if (currentDivergence == null) {
             return false;
@@ -558,7 +587,8 @@ public class EnrichedSnapshotPlaybackService {
         return rawTime != null ? LocalTime.parse(String.valueOf(rawTime)) : null;
     }
 
-    /** One simulated CE/PE trade recorded by the backtest engine. {@code exitTime}/{@code exitNifty}/
+    */
+/** One simulated CE/PE trade recorded by the backtest engine. {@code exitTime}/{@code exitNifty}/
      * {@code exitPremium}/{@code pnl} are {@code null} when {@code exitReason} is {@code "OPEN_AT_END"}
      * (playback stopped/finished while this trade was still open). {@code marketTrend} is the 20-minute
      * NIFTY market-direction filter's verdict ({@code "BULLISH"}/{@code "BEARISH"}/{@code "REVERSAL_CANDIDATE"})
@@ -566,15 +596,18 @@ public class EnrichedSnapshotPlaybackService {
      * {@code entryPeDivergence30m} are the shared rolling 30-minute CE/PE divergence values at entry time,
      * and {@code exitCeDivergence30m}/{@code exitPeDivergence30m} the same at exit time (both {@code null}
      * for an {@code "OPEN_AT_END"} trade) — recorded purely for backtest-result review, alongside (not
-     * instead of) the order-anchored divergence math that actually drives the exit decision. */
+     * instead of) the order-anchored divergence math that actually drives the exit decision. *//*
+
     public record BacktestTrade(String direction, LocalTime entryTime, double entryNifty, double entryPremium,
                                  String entryType, String marketTrend, Double entryCeDivergence30m, Double entryPeDivergence30m,
                                  LocalTime exitTime, Double exitNifty, Double exitPremium, String exitReason,
                                  Double exitCeDivergence30m, Double exitPeDivergence30m, Double pnl) {
     }
 
-    /** Mutable in-progress simulated position, mirroring the fields {@code PaperTradingService}'s
-     * {@code PaperOrderState} tracks for an open trade (minus anything DB-persistence-specific). */
+    */
+/** Mutable in-progress simulated position, mirroring the fields {@code PaperTradingService}'s
+     * {@code PaperOrderState} tracks for an open trade (minus anything DB-persistence-specific). *//*
+
     private static final class BacktestPosition {
         final String direction;
         final String entryType;
@@ -617,3 +650,4 @@ public class EnrichedSnapshotPlaybackService {
         executor.shutdownNow();
     }
 }
+*/

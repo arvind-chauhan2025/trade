@@ -1,3 +1,4 @@
+/*
 package com.example.demo.controller;
 
 import com.example.demo.service.EnrichedSnapshotPlaybackService;
@@ -11,11 +12,13 @@ import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
 
+*/
 /** Controls replaying a past trade date's already-persisted {@code enriched_snapshot} rows back over the
  * {@code /ws/tick-snapshot} WebSocket, via {@link EnrichedSnapshotPlaybackService}. Intended for reviewing
  * historical sessions on the dashboard. Optionally (with {@code backtest=true}) also runs an in-memory
  * simulated paper-trading engine alongside the replay (see {@link EnrichedSnapshotPlaybackService} class
- * doc); this never touches the live {@code PaperTradingService}/order tables. */
+ * doc); this never touches the live {@code PaperTradingService}/order tables. *//*
+
 @RestController
 public class EnrichedSnapshotPlaybackController {
 
@@ -25,11 +28,13 @@ public class EnrichedSnapshotPlaybackController {
         this.playbackService = playbackService;
     }
 
-    /** Starts replaying {@code date}'s persisted enriched snapshots from the beginning, at {@code speed}x
+    */
+/** Starts replaying {@code date}'s persisted enriched snapshots from the beginning, at {@code speed}x
      * the original tick pace (default {@code 15.0}). Stops any playback already in progress. When
      * {@code backtest=true} (default {@code true}), also re-runs the in-memory simulated paper-trading
      * engine over the same rows; fetch its results afterwards via {@code GET /api/playback/backtest-results}.
-     * Returns how many rows were queued (0 if none exist for that date). */
+     * Returns how many rows were queued (0 if none exist for that date). *//*
+
     @PostMapping("/api/playback/start")
     public Map<String, Object> start(
             @RequestParam(name = "date") @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
@@ -39,14 +44,18 @@ public class EnrichedSnapshotPlaybackController {
         return Map.of("date", date, "speed", speed, "backtest", backtest, "rows", rowCount, "started", rowCount > 0);
     }
 
-    /** Stops whatever playback is currently in progress (no-op if none). */
+    */
+/** Stops whatever playback is currently in progress (no-op if none). *//*
+
     @PostMapping("/api/playback/stop")
     public Map<String, Object> stop() {
         playbackService.stop();
         return Map.of("running", playbackService.isRunning());
     }
 
-    /** Reports whether a playback is currently in progress and, if so, which date. */
+    */
+/** Reports whether a playback is currently in progress and, if so, which date. *//*
+
     @GetMapping("/api/playback/status")
     public Map<String, Object> status() {
         boolean running = playbackService.isRunning();
@@ -54,8 +63,10 @@ public class EnrichedSnapshotPlaybackController {
         return running ? Map.of("running", true, "date", date) : Map.of("running", false);
     }
 
-    /** Simulated trades recorded by the current/most recent backtest run (empty if the last
-     * {@code start} didn't have {@code backtest=true}, or none has run yet), plus a simple summary. */
+    */
+/** Simulated trades recorded by the current/most recent backtest run (empty if the last
+     * {@code start} didn't have {@code backtest=true}, or none has run yet), plus a simple summary. *//*
+
     @GetMapping("/api/playback/backtest-results")
     public Map<String, Object> backtestResults() {
         List<EnrichedSnapshotPlaybackService.BacktestTrade> trades = playbackService.lastBacktestTrades();
@@ -71,3 +82,4 @@ public class EnrichedSnapshotPlaybackController {
                 "netPnl", netPnl);
     }
 }
+*/

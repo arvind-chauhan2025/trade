@@ -193,7 +193,7 @@ public class TickPersistenceService {
             log.warn("Complete snapshot queue is full; dropping complete snapshot for {}", tick.tickTime());
         }
         if (updated.isComplete()) {
-            latestCompleteSnapshot = updated;
+             latestCompleteSnapshot = updated;
             premiumReferenceService.captureIfNeeded(updated);
         }
     }
