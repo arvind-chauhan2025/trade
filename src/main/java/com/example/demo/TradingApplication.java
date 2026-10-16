@@ -122,8 +122,7 @@ public class TradingApplication implements ApplicationRunner {
     /** Starts the NIFTY streaming pipeline every trading weekday at 9:15 AM IST (market open). Always
      * (re)computes ATM/FIXED ITM CE/PE from that morning's own spot price — never restored from a
      * previous day — so the "morning snapshot" baseline is fresh every trading day. */
-    //@Scheduled(cron = "0 15 9 * * MON-FRI", zone = "Asia/Kolkata")
-    @Scheduled(cron = "0 05 21 * * MON-FRI", zone = "Asia/Kolkata")
+    @Scheduled(cron = "0 15 9 * * MON-FRI", zone = "Asia/Kolkata")
     public void startPipeline() {
         try {
             double spot = niftySpotPriceService.getNiftySpotPrice().ltp();
@@ -163,6 +162,8 @@ public class TradingApplication implements ApplicationRunner {
                     "ATM CE", atmCe, "ATM PE", atmPe,
                     "FIXED ITM CE", fixed.ce(), "FIXED ITM PE", fixed.pe());
             lastAtmItmSelectionAt = Instant.now();
+            premiumReferenceService.setExpectedStrikes(atmCe, atmPe, fixed.ce(), fixed.pe());
+            premiumReferenceService.resetRollingReferenceIfStaleFor(atmCe, atmPe, fixed.ce(), fixed.pe());
 
             try {
                 greeksCacheService.refresh(trackedExpiry, trackedContracts);
@@ -262,6 +263,7 @@ public class TradingApplication implements ApplicationRunner {
                 } catch (Exception ex) {
                     log.warn("Failed to refresh Option Greeks after rolling ATM/ITM re-selection", ex);
                 }
+                premiumReferenceService.setExpectedStrikes(newAtmCe, newAtmPe, newItm.ce(), newItm.pe());
                 premiumReferenceService.resetRollingReference();
             } else {
                 log.debug("30-min rolling window elapsed (spot={}); ATM/ITM strikes unchanged", spot);

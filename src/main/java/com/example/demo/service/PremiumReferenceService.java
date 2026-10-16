@@ -1,5 +1,6 @@
 package com.example.demo.service;
 
+import com.example.demo.dto.OptionContract;
 import com.example.demo.dto.TickSnapshot;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
@@ -81,6 +82,17 @@ public class PremiumReferenceService {
     private volatile LocalDate rollingReferenceDate;
     private volatile ReferenceData rollingReference;
     private volatile PaperTradingService paperTradingService;
+    /** The strikes {@code TradingApplication} most recently (re)selected (at startup or a 30-minute
+     * re-selection), set via {@link #setExpectedStrikes}. {@link #captureIfNeeded} refuses to capture a
+     * reference from a snapshot unless every leg's strike matches this, guarding against a snapshot that's
+     * "complete" (every field non-null) yet still has one leg's *previous* strike's premium because that
+     * leg hasn't ticked under its new subscription yet. {@code null} means no selection has been recorded
+     * yet (e.g. mock/test snapshots bypassing {@code TradingApplication} entirely) — in that case the
+     * check is skipped rather than blocking capture forever. */
+    private volatile ExpectedStrikes expectedStrikes;
+
+    private record ExpectedStrikes(double atmCe, double atmPe, double fixedItmCe, double fixedItmPe) {
+    }
 
     // @Lazy breaks the PremiumReferenceService <-> PaperTradingService constructor-injection cycle:
     // PaperTradingService needs a fully-constructed PremiumReferenceService, and PremiumReferenceService
@@ -228,6 +240,20 @@ public class PremiumReferenceService {
             return;
         }
 
+        if (!matchesExpectedStrikes(snapshot)) {
+            // A multi-leg ATM/ITM re-selection (or a restart that picked different strikes) doesn't
+            // guarantee every leg's first tick under the new strike arrives at the same instant: this
+            // snapshot can be "complete" (every field non-null) yet still carry one leg's *previous*
+            // strike's premium because that leg simply hasn't ticked under the new subscription yet.
+            // Capturing it now would silently bake a stale strike's premium into the reference for the
+            // rest of this 30-minute window. Skip and let the very next complete snapshot try again —
+            // once every leg matches, this check passes and the capture proceeds normally.
+            log.debug("Skipping reference capture at {}: snapshot strikes don't yet all match the latest "
+                    + "ATM/ITM selection (still waiting for some leg's first tick under its new strike)",
+                    snapshot.tickTime());
+            return;
+        }
+
         ReferenceData captured = captureReferenceData(snapshot);
 
         if (dayReferenceMissingToday) {
@@ -301,6 +327,60 @@ public class PremiumReferenceService {
                     + "could otherwise restore the now-invalidated strike's reference", ex);
         }
         log.info("Rolling reference invalidated (ATM/ITM re-selection changed strikes); will recapture from next complete snapshot");
+    }
+
+    /** Called by {@code TradingApplication.startPipeline()} right after a (re)start's fresh ATM/FIXED ITM
+     * selection. A restart always re-derives strikes from the current spot price (never from a previous
+     * day/session), but {@link #init()} separately restores whatever rolling reference was persisted
+     * <b>before</b> the restart — which may belong to a now-different strike (e.g. restarted mid-day
+     * after spot moved). Without this check, that stale reference would sit mismatched against the new
+     * strike until its own unrelated 30-minute timer happens to elapse (see {@link #resetRollingReference()}),
+     * leaving divergence null for however long that gap is. No-op if no rolling reference was restored, or
+     * if its strikes already match the fresh selection. */
+    public void resetRollingReferenceIfStaleFor(OptionContract atmCe, OptionContract atmPe,
+                                                 OptionContract fixedItmCe, OptionContract fixedItmPe) {
+        ReferenceData ref = rollingReference;
+        if (ref == null) {
+            return;
+        }
+        boolean mismatched = !sameStrike(ref.atmCeStrike(), atmCe.strike())
+                || !sameStrike(ref.atmPeStrike(), atmPe.strike())
+                || !sameStrike(ref.fixedItmCeStrike(), fixedItmCe.strike())
+                || !sameStrike(ref.fixedItmPeStrike(), fixedItmPe.strike());
+        if (mismatched) {
+            log.info("Restored rolling reference strikes don't match this (re)start's freshly selected "
+                    + "ATM/ITM strikes; invalidating so a stale strike's premium is never compared against the new one");
+            resetRollingReference();
+        }
+    }
+
+    private static boolean sameStrike(Double referenceStrike, double actualStrike) {
+        return referenceStrike != null && Double.compare(referenceStrike, actualStrike) == 0;
+    }
+
+    /** Records the strikes {@code TradingApplication} just selected (at startup, in {@code startPipeline()},
+     * and on every 30-minute re-selection), so {@link #captureIfNeeded} can verify a candidate snapshot is
+     * fully consistent with them before trusting it as a fresh reference. Call this <i>before</i> {@link
+     * #resetRollingReference()}/{@link #resetRollingReferenceIfStaleFor} so the very next capture attempt
+     * already validates against the up-to-date target. */
+    public void setExpectedStrikes(OptionContract atmCe, OptionContract atmPe,
+                                    OptionContract fixedItmCe, OptionContract fixedItmPe) {
+        this.expectedStrikes = new ExpectedStrikes(atmCe.strike(), atmPe.strike(), fixedItmCe.strike(), fixedItmPe.strike());
+    }
+
+    /** Returns {@code true} if every leg in {@code snapshot} matches the last-recorded {@link
+     * #setExpectedStrikes} target (or if no target has been recorded yet, e.g. mock/test snapshots that
+     * bypass {@code TradingApplication} entirely — in which case the check is skipped rather than
+     * blocking capture forever). */
+    private boolean matchesExpectedStrikes(TickSnapshot snapshot) {
+        ExpectedStrikes expected = expectedStrikes;
+        if (expected == null) {
+            return true;
+        }
+        return sameStrike(snapshot.atmCeStrike(), expected.atmCe())
+                && sameStrike(snapshot.atmPeStrike(), expected.atmPe())
+                && sameStrike(snapshot.fixedItmCeStrike(), expected.fixedItmCe())
+                && sameStrike(snapshot.fixedItmPeStrike(), expected.fixedItmPe());
     }
 
     /** Returns a flattened view of {@code snapshot} (every TickSnapshot field) plus, once each reference
