@@ -183,7 +183,7 @@ public class TickPersistenceService {
      * populated, the completed snapshot is also pushed onto {@link #snapshotQueue}. */
     public void offer(TickRecord tick) {
         LocalTime time = LocalTime.parse(tick.tickTime(), TICK_TIME_PARSER);
-        Double delta = greeksCacheService.getDelta(tick.label());
+        Double delta = greeksCacheService.getDelta(tick.label(), tick.strike());
         TickSnapshot updated = snapshotsByTime.compute(time, (t, existing) ->
                 (existing != null ? existing : TickSnapshot.empty(t)).with(tick.label(), tick.price(), tick.strike(), delta));
         if (!queue.offer(tick)) {
@@ -293,7 +293,7 @@ public class TickPersistenceService {
      * per time that fills in progressively as each label ticks, as opposed to {@code tick_snapshot} which only
      * gets a row once every label is present. */
     private void persist(TickRecord tick) {
-        Double delta = greeksCacheService.getDelta(tick.label());
+        Double delta = greeksCacheService.getDelta(tick.label(), tick.strike());
         LocalDate today = LocalDate.now();
         switch (tick.label()) {
             case "NIFTY" -> jdbcTemplate.update("""

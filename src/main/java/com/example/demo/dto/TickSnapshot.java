@@ -32,29 +32,41 @@ public record TickSnapshot(
     }
 
     /** Returns a copy with the given label's price, strike (for option labels) and cached Delta (if any) updated;
-     * other fields are preserved. */
+     * other fields are preserved. If the freshly looked-up {@code delta} is {@code null} (e.g. the Greeks
+     * cache hasn't caught up to a new strike yet, see {@link com.example.demo.service.GreeksCacheService#getDelta(String, double)}),
+     * falls back to this label's previously stored Delta only when {@code strike} matches the strike that
+     * old Delta was recorded for; otherwise it would silently carry a stale, wrong-strike Delta forward
+     * across a strike change. */
     public TickSnapshot with(String label, double price, double strike, Double delta) {
         return switch (label) {
             case "NIFTY" -> new TickSnapshot(tickTime, price, atmCe, atmCeStrike, atmCeDelta,
                     atmPe, atmPeStrike, atmPeDelta, fixedItmCe, fixedItmCeStrike, fixedItmCeDelta,
                     fixedItmPe, fixedItmPeStrike, fixedItmPeDelta, niftyFut);
-            case "ATM CE" -> new TickSnapshot(tickTime, nifty, price, strike, delta != null ? delta : atmCeDelta,
+            case "ATM CE" -> new TickSnapshot(tickTime, nifty, price, strike,
+                    delta != null ? delta : (sameStrike(atmCeStrike, strike) ? atmCeDelta : null),
                     atmPe, atmPeStrike, atmPeDelta, fixedItmCe, fixedItmCeStrike, fixedItmCeDelta,
                     fixedItmPe, fixedItmPeStrike, fixedItmPeDelta, niftyFut);
             case "ATM PE" -> new TickSnapshot(tickTime, nifty, atmCe, atmCeStrike, atmCeDelta,
-                    price, strike, delta != null ? delta : atmPeDelta, fixedItmCe, fixedItmCeStrike, fixedItmCeDelta,
+                    price, strike, delta != null ? delta : (sameStrike(atmPeStrike, strike) ? atmPeDelta : null),
+                    fixedItmCe, fixedItmCeStrike, fixedItmCeDelta,
                     fixedItmPe, fixedItmPeStrike, fixedItmPeDelta, niftyFut);
             case "FIXED ITM CE" -> new TickSnapshot(tickTime, nifty, atmCe, atmCeStrike, atmCeDelta,
-                    atmPe, atmPeStrike, atmPeDelta, price, strike, delta != null ? delta : fixedItmCeDelta,
+                    atmPe, atmPeStrike, atmPeDelta, price, strike,
+                    delta != null ? delta : (sameStrike(fixedItmCeStrike, strike) ? fixedItmCeDelta : null),
                     fixedItmPe, fixedItmPeStrike, fixedItmPeDelta, niftyFut);
             case "FIXED ITM PE" -> new TickSnapshot(tickTime, nifty, atmCe, atmCeStrike, atmCeDelta,
                     atmPe, atmPeStrike, atmPeDelta, fixedItmCe, fixedItmCeStrike, fixedItmCeDelta,
-                    price, strike, delta != null ? delta : fixedItmPeDelta, niftyFut);
+                    price, strike, delta != null ? delta : (sameStrike(fixedItmPeStrike, strike) ? fixedItmPeDelta : null),
+                    niftyFut);
             case "NIFTY FUT" -> new TickSnapshot(tickTime, nifty, atmCe, atmCeStrike, atmCeDelta,
                     atmPe, atmPeStrike, atmPeDelta, fixedItmCe, fixedItmCeStrike, fixedItmCeDelta,
                     fixedItmPe, fixedItmPeStrike, fixedItmPeDelta, price);
             default -> this;
         };
+    }
+
+    private static boolean sameStrike(Double previousStrike, double currentStrike) {
+        return previousStrike != null && Double.compare(previousStrike, currentStrike) == 0;
     }
 
     /** True once every tracked label (NIFTY, ATM CE/PE, FIXED ITM CE/PE and NIFTY FUT) has a price for this tick time. */

@@ -47,11 +47,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * naturally decays the expected premium as elapsed time grows. No expected value/divergence is computed
  * until the relevant reference has been captured for the day.
  * <p>
- * Both reference points are also durably persisted to the {@code premium_reference} Postgres table
- * (keyed by {@code tick_date} + a {@code day}/{@code rolling} type) on every capture, and restored from
- * there on startup ({@link #init()}) for today's date. This means a machine/app restart mid-day does
- * <b>not</b> flush them and force a later, artificial re-baseline — the original 9:15 AM day reference (and
- * whichever 30-minute window the rolling reference was captured in) survives the restart intact.
+ * Both reference points are also durably persisted to the {@code premium_reference} Postgres table (tagged
+ * with {@code tick_date} and a {@code day}/{@code rolling} type) on every capture. Every capture
+ * <b>appends a new row</b> rather than overwriting or deleting the previous one — whether it's the 9:15 AM
+ * day reference, a scheduled 30-minute rolling recapture, an ATM/ITM-triggered recapture, or a manual
+ * refresh via the REST endpoint — so the full history of references captured today (and on prior days)
+ * stays in the table. Only the most recent, non-invalidated row per type/day is restored on startup
+ * ({@link #init()}/{@link #restoreFromDatabase()}) or considered "current"; {@link #resetRollingReference()}
+ * marks a row {@code invalidated} instead of deleting it when ATM/ITM re-selection makes it stale. This
+ * means a machine/app restart mid-day does <b>not</b> flush today's references and force a later,
+ * artificial re-baseline — the original 9:15 AM day reference (and whichever 30-minute window the rolling
+ * reference was captured in) survives the restart intact.
  * <p>
  * {@code TradingApplication} also re-selects the actual ATM/FIXED ITM CE/PE <b>strikes</b> every 30
  * minutes as spot moves (held fixed within each window) and calls {@link #resetRollingReference()}
@@ -114,6 +120,8 @@ public class PremiumReferenceService {
                     tick_date DATE NOT NULL,
                     ref_type VARCHAR(16) NOT NULL,
                     tick_time VARCHAR(16) NOT NULL,
+                    captured_at TIMESTAMP NOT NULL DEFAULT now(),
+                    invalidated BOOLEAN NOT NULL DEFAULT FALSE,
                     nifty DOUBLE PRECISION NOT NULL,
                     atm_ce DOUBLE PRECISION NOT NULL, atm_ce_strike DOUBLE PRECISION,
                     atm_ce_delta DOUBLE PRECISION, atm_ce_gamma DOUBLE PRECISION, atm_ce_theta DOUBLE PRECISION,
@@ -122,10 +130,16 @@ public class PremiumReferenceService {
                     fixed_itm_ce DOUBLE PRECISION NOT NULL, fixed_itm_ce_strike DOUBLE PRECISION,
                     fixed_itm_ce_delta DOUBLE PRECISION, fixed_itm_ce_gamma DOUBLE PRECISION, fixed_itm_ce_theta DOUBLE PRECISION,
                     fixed_itm_pe DOUBLE PRECISION NOT NULL, fixed_itm_pe_strike DOUBLE PRECISION,
-                    fixed_itm_pe_delta DOUBLE PRECISION, fixed_itm_pe_gamma DOUBLE PRECISION, fixed_itm_pe_theta DOUBLE PRECISION,
-                    PRIMARY KEY (tick_date, ref_type)
+                    fixed_itm_pe_delta DOUBLE PRECISION, fixed_itm_pe_gamma DOUBLE PRECISION, fixed_itm_pe_theta DOUBLE PRECISION
                 )
                 """);
+        // Migration for tables created before history-keeping was added: drop the old (tick_date, ref_type)
+        // primary key (which forced one row per type per day and made every recapture overwrite the
+        // previous one via upsert) and add the new bookkeeping columns, so every capture from here on
+        // appends a new row instead of overwriting/deleting the prior reference.
+        jdbcTemplate.execute("ALTER TABLE premium_reference DROP CONSTRAINT IF EXISTS premium_reference_pkey");
+        jdbcTemplate.execute("ALTER TABLE premium_reference ADD COLUMN IF NOT EXISTS captured_at TIMESTAMP NOT NULL DEFAULT now()");
+        jdbcTemplate.execute("ALTER TABLE premium_reference ADD COLUMN IF NOT EXISTS invalidated BOOLEAN NOT NULL DEFAULT FALSE");
         restoreFromDatabase();
     }
 
@@ -135,8 +149,15 @@ public class PremiumReferenceService {
     private void restoreFromDatabase() {
         LocalDate today = LocalDate.now();
         try {
+            // One row per ref_type: the most recently captured, still-valid (not invalidated) reference for
+            // today. History (every earlier capture) stays in the table untouched; we just need today's
+            // current one per type to resume from after a restart.
             List<PersistedReference> rows = jdbcTemplate.query(
-                    "SELECT * FROM premium_reference WHERE tick_date = ?",
+                    """
+                    SELECT DISTINCT ON (ref_type) * FROM premium_reference
+                    WHERE tick_date = ? AND invalidated = FALSE
+                    ORDER BY ref_type, captured_at DESC
+                    """,
                     (rs, rowNum) -> new PersistedReference(rs.getString("ref_type"), mapRow(rs)),
                     today);
             for (PersistedReference row : rows) {
@@ -173,35 +194,33 @@ public class PremiumReferenceService {
         return rs.wasNull() ? null : value;
     }
 
-    /** Upserts {@code data} as the persisted reference of {@code type} for {@code date}, so it survives a
-     * restart. Persistence failures are logged but non-fatal — the in-memory reference stays authoritative
-     * for the rest of this process's lifetime either way. */
+    /** Inserts {@code data} as a brand-new persisted reference row of {@code type} for {@code date}, so it
+     * survives a restart. Unlike the previous upsert-by-(tick_date, ref_type) behavior, this never
+     * overwrites or deletes an earlier capture — every 30-minute rolling recapture (whether from the
+     * scheduled re-selection or the manual refresh endpoint) appends its own row with its own
+     * {@code tick_time}/{@code captured_at}, so the full history of references captured today is kept in
+     * the table. Only {@link #restoreFromDatabase()} and {@link #resetRollingReference()} care about which
+     * row is "current" per type, via {@code invalidated}/{@code captured_at}. Persistence failures are
+     * logged but non-fatal — the in-memory reference stays authoritative for the rest of this process's
+     * lifetime either way. */
     private void persist(String type, LocalDate date, ReferenceData data) {
         try {
             jdbcTemplate.update("""
                     INSERT INTO premium_reference (
-                        tick_date, ref_type, tick_time, nifty,
+                        tick_date, ref_type, tick_time,
                         atm_ce, atm_ce_strike, atm_ce_delta, atm_ce_gamma, atm_ce_theta,
                         atm_pe, atm_pe_strike, atm_pe_delta, atm_pe_gamma, atm_pe_theta,
                         fixed_itm_ce, fixed_itm_ce_strike, fixed_itm_ce_delta, fixed_itm_ce_gamma, fixed_itm_ce_theta,
-                        fixed_itm_pe, fixed_itm_pe_strike, fixed_itm_pe_delta, fixed_itm_pe_gamma, fixed_itm_pe_theta
+                        fixed_itm_pe, fixed_itm_pe_strike, fixed_itm_pe_delta, fixed_itm_pe_gamma, fixed_itm_pe_theta,
+                        nifty
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (tick_date, ref_type) DO UPDATE SET
-                        tick_time = EXCLUDED.tick_time, nifty = EXCLUDED.nifty,
-                        atm_ce = EXCLUDED.atm_ce, atm_ce_strike = EXCLUDED.atm_ce_strike,
-                        atm_ce_delta = EXCLUDED.atm_ce_delta, atm_ce_gamma = EXCLUDED.atm_ce_gamma, atm_ce_theta = EXCLUDED.atm_ce_theta,
-                        atm_pe = EXCLUDED.atm_pe, atm_pe_strike = EXCLUDED.atm_pe_strike,
-                        atm_pe_delta = EXCLUDED.atm_pe_delta, atm_pe_gamma = EXCLUDED.atm_pe_gamma, atm_pe_theta = EXCLUDED.atm_pe_theta,
-                        fixed_itm_ce = EXCLUDED.fixed_itm_ce, fixed_itm_ce_strike = EXCLUDED.fixed_itm_ce_strike,
-                        fixed_itm_ce_delta = EXCLUDED.fixed_itm_ce_delta, fixed_itm_ce_gamma = EXCLUDED.fixed_itm_ce_gamma, fixed_itm_ce_theta = EXCLUDED.fixed_itm_ce_theta,
-                        fixed_itm_pe = EXCLUDED.fixed_itm_pe, fixed_itm_pe_strike = EXCLUDED.fixed_itm_pe_strike,
-                        fixed_itm_pe_delta = EXCLUDED.fixed_itm_pe_delta, fixed_itm_pe_gamma = EXCLUDED.fixed_itm_pe_gamma, fixed_itm_pe_theta = EXCLUDED.fixed_itm_pe_theta
                     """,
-                    date, type, data.time().toString(), data.nifty(),
+                    date, type, data.time().toString(),
                     data.atmCe(), data.atmCeStrike(), data.atmCeDelta(), data.atmCeGamma(), data.atmCeTheta(),
                     data.atmPe(), data.atmPeStrike(), data.atmPeDelta(), data.atmPeGamma(), data.atmPeTheta(),
                     data.fixedItmCe(), data.fixedItmCeStrike(), data.fixedItmCeDelta(), data.fixedItmCeGamma(), data.fixedItmCeTheta(),
-                    data.fixedItmPe(), data.fixedItmPeStrike(), data.fixedItmPeDelta(), data.fixedItmPeGamma(), data.fixedItmPeTheta());
+                    data.fixedItmPe(), data.fixedItmPeStrike(), data.fixedItmPeDelta(), data.fixedItmPeGamma(), data.fixedItmPeTheta(),
+                    data.nifty());
         } catch (Exception ex) {
             log.warn("Failed to persist {} reference to database (in-memory value is still active; will retry on next capture)", type, ex);
         }
@@ -298,10 +317,10 @@ public class PremiumReferenceService {
         return new ReferenceData(
                 snapshot.tickTime(),
                 snapshot.nifty(),
-                snapshot.atmCe(), snapshot.atmCeStrike(), greeksCacheService.getDelta("ATM CE"), greeksCacheService.getGamma("ATM CE"), greeksCacheService.getTheta("ATM CE"),
-                snapshot.atmPe(), snapshot.atmPeStrike(), greeksCacheService.getDelta("ATM PE"), greeksCacheService.getGamma("ATM PE"), greeksCacheService.getTheta("ATM PE"),
-                snapshot.fixedItmCe(), snapshot.fixedItmCeStrike(), greeksCacheService.getDelta("FIXED ITM CE"), greeksCacheService.getGamma("FIXED ITM CE"), greeksCacheService.getTheta("FIXED ITM CE"),
-                snapshot.fixedItmPe(), snapshot.fixedItmPeStrike(), greeksCacheService.getDelta("FIXED ITM PE"), greeksCacheService.getGamma("FIXED ITM PE"), greeksCacheService.getTheta("FIXED ITM PE")
+                snapshot.atmCe(), snapshot.atmCeStrike(), greeksCacheService.getDelta("ATM CE", snapshot.atmCeStrike()), greeksCacheService.getGamma("ATM CE", snapshot.atmCeStrike()), greeksCacheService.getTheta("ATM CE", snapshot.atmCeStrike()),
+                snapshot.atmPe(), snapshot.atmPeStrike(), greeksCacheService.getDelta("ATM PE", snapshot.atmPeStrike()), greeksCacheService.getGamma("ATM PE", snapshot.atmPeStrike()), greeksCacheService.getTheta("ATM PE", snapshot.atmPeStrike()),
+                snapshot.fixedItmCe(), snapshot.fixedItmCeStrike(), greeksCacheService.getDelta("FIXED ITM CE", snapshot.fixedItmCeStrike()), greeksCacheService.getGamma("FIXED ITM CE", snapshot.fixedItmCeStrike()), greeksCacheService.getTheta("FIXED ITM CE", snapshot.fixedItmCeStrike()),
+                snapshot.fixedItmPe(), snapshot.fixedItmPeStrike(), greeksCacheService.getDelta("FIXED ITM PE", snapshot.fixedItmPeStrike()), greeksCacheService.getGamma("FIXED ITM PE", snapshot.fixedItmPeStrike()), greeksCacheService.getTheta("FIXED ITM PE", snapshot.fixedItmPeStrike())
         );
     }
 
@@ -320,10 +339,13 @@ public class PremiumReferenceService {
         rollingReferenceDate = null;
         resetAtmItmFlag.set(true);
         try {
-            jdbcTemplate.update("DELETE FROM premium_reference WHERE ref_type = ? AND tick_date = ?",
+            // Mark rather than delete: keeps this now-abandoned-strike capture in the history table instead
+            // of erasing it, while still ensuring a restart before the next capture won't restore it (see
+            // restoreFromDatabase(), which only considers invalidated = FALSE rows).
+            jdbcTemplate.update("UPDATE premium_reference SET invalidated = TRUE WHERE ref_type = ? AND tick_date = ? AND invalidated = FALSE",
                     ROLLING_REF_TYPE, LocalDate.now());
         } catch (Exception ex) {
-            log.warn("Failed to delete persisted rolling reference row; a restart before the next capture "
+            log.warn("Failed to invalidate persisted rolling reference row; a restart before the next capture "
                     + "could otherwise restore the now-invalidated strike's reference", ex);
         }
         log.info("Rolling reference invalidated (ATM/ITM re-selection changed strikes); will recapture from next complete snapshot");
@@ -506,9 +528,9 @@ public class PremiumReferenceService {
         return new FixedItmOrderReference(
                 snapshot.tickTime(), snapshot.nifty(),
                 snapshot.fixedItmCe(), snapshot.fixedItmCeStrike(),
-                greeksCacheService.getDelta("FIXED ITM CE"), greeksCacheService.getGamma("FIXED ITM CE"), greeksCacheService.getTheta("FIXED ITM CE"),
+                greeksCacheService.getDelta("FIXED ITM CE", snapshot.fixedItmCeStrike()), greeksCacheService.getGamma("FIXED ITM CE", snapshot.fixedItmCeStrike()), greeksCacheService.getTheta("FIXED ITM CE", snapshot.fixedItmCeStrike()),
                 snapshot.fixedItmPe(), snapshot.fixedItmPeStrike(),
-                greeksCacheService.getDelta("FIXED ITM PE"), greeksCacheService.getGamma("FIXED ITM PE"), greeksCacheService.getTheta("FIXED ITM PE")
+                greeksCacheService.getDelta("FIXED ITM PE", snapshot.fixedItmPeStrike()), greeksCacheService.getGamma("FIXED ITM PE", snapshot.fixedItmPeStrike()), greeksCacheService.getTheta("FIXED ITM PE", snapshot.fixedItmPeStrike())
         );
     }
 

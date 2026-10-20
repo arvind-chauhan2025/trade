@@ -83,27 +83,76 @@ public class GreeksCacheService {
         });
     }
 
-    /** Returns the cached Delta for a label (ATM CE, ATM PE, FIXED ITM CE, FIXED ITM PE), or null if unavailable. */
+    /** Returns the cached Delta for a label (ATM CE, ATM PE, FIXED ITM CE, FIXED ITM PE), or null if unavailable.
+     * <p>
+     * <b>Does not validate strike.</b> Between an ATM/ITM re-selection and the next successful Greeks
+     * refresh for the new strike (e.g. the refresh runs every 30s, or Angel One's Greeks API briefly has
+     * no entry for the new strike), this label's cached {@link OptionGreek} can still belong to the
+     * <i>previous</i> strike. Callers that also know the strike the Greek should belong to (the live
+     * tick/snapshot's actual strike) should prefer {@link #getDelta(String, double)}, which returns
+     * {@code null} instead of silently handing back a different strike's Delta. */
     public Double getDelta(String label) {
         OptionGreek greek = greeksByLabel.get(label);
         return greek != null ? greek.delta() : null;
     }
 
-    /** Returns the cached Gamma for a label, or null if unavailable. */
+    /** Returns the cached Gamma for a label, or null if unavailable. See {@link #getDelta(String)} for the
+     * staleness caveat; prefer {@link #getGamma(String, double)} when the expected strike is known. */
     public Double getGamma(String label) {
         OptionGreek greek = greeksByLabel.get(label);
         return greek != null ? greek.gamma() : null;
     }
 
-    /** Returns the cached Theta for a label (per day, sign as returned by the broker), or null if unavailable. */
+    /** Returns the cached Theta for a label (per day, sign as returned by the broker), or null if unavailable.
+     * See {@link #getDelta(String)} for the staleness caveat; prefer {@link #getTheta(String, double)}
+     * when the expected strike is known. */
     public Double getTheta(String label) {
         OptionGreek greek = greeksByLabel.get(label);
         return greek != null ? greek.theta() : null;
     }
 
-    /** Returns the full cached {@link OptionGreek} for a label, or null if unavailable. */
+    /** Returns the full cached {@link OptionGreek} for a label, or null if unavailable. See
+     * {@link #getDelta(String)} for the staleness caveat; prefer {@link #getGreek(String, double)} when
+     * the expected strike is known. */
     public OptionGreek getGreek(String label) {
         return greeksByLabel.get(label);
+    }
+
+    /** Strike-validated variant of {@link #getGreek(String)}: returns the cached {@link OptionGreek} for
+     * {@code label} only if it was fetched for exactly {@code expectedStrike}. Returns {@code null} (and
+     * logs a warning) if the cache is empty for this label, or still holds a different strike's Greek —
+     * e.g. right after an ATM/ITM re-selection swapped strikes but the periodic Greeks refresh hasn't
+     * caught up yet. This prevents attaching a stale, wrong-strike Delta/Gamma/Theta to a tick or premium
+     * reference for the new strike. */
+    public OptionGreek getGreek(String label, double expectedStrike) {
+        OptionGreek greek = greeksByLabel.get(label);
+        if (greek == null) {
+            return null;
+        }
+        if (Double.compare(greek.strike(), expectedStrike) != 0) {
+            log.warn("Stale Greeks for {}: cached strike={} but expected strike={}; suppressing to avoid "
+                    + "mismatched Delta/Gamma/Theta", label, greek.strike(), expectedStrike);
+            return null;
+        }
+        return greek;
+    }
+
+    /** Strike-validated variant of {@link #getDelta(String)}; see {@link #getGreek(String, double)}. */
+    public Double getDelta(String label, double expectedStrike) {
+        OptionGreek greek = getGreek(label, expectedStrike);
+        return greek != null ? greek.delta() : null;
+    }
+
+    /** Strike-validated variant of {@link #getGamma(String)}; see {@link #getGreek(String, double)}. */
+    public Double getGamma(String label, double expectedStrike) {
+        OptionGreek greek = getGreek(label, expectedStrike);
+        return greek != null ? greek.gamma() : null;
+    }
+
+    /** Strike-validated variant of {@link #getTheta(String)}; see {@link #getGreek(String, double)}. */
+    public Double getTheta(String label, double expectedStrike) {
+        OptionGreek greek = getGreek(label, expectedStrike);
+        return greek != null ? greek.theta() : null;
     }
 
     /** Returns an immutable snapshot of all cached Deltas. */
