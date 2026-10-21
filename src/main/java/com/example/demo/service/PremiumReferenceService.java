@@ -1,5 +1,6 @@
 package com.example.demo.service;
 
+import com.example.demo.config.AngelOneProperties;
 import com.example.demo.dto.OptionContract;
 import com.example.demo.dto.TickSnapshot;
 import jakarta.annotation.PostConstruct;
@@ -71,12 +72,12 @@ public class PremiumReferenceService {
 
     private static final Logger log = LoggerFactory.getLogger(PremiumReferenceService.class);
     private static final LocalTime MARKET_OPEN = LocalTime.of(9, 15);
-    private static final Duration ROLLING_INTERVAL = Duration.ofMinutes(30);
     private static final String DAY_REF_TYPE = "day";
     private static final String ROLLING_REF_TYPE = "rolling";
 
     private final GreeksCacheService greeksCacheService;
     private final JdbcTemplate jdbcTemplate;
+    private final AngelOneProperties properties;
     /** Set {@code true} by {@link #resetRollingReference()} and consumed (read-then-cleared) by the very
      * next {@link #enrich} call, so exactly one enriched snapshot/broadcast cycle after an ATM/ITM
      * strike-driven rolling reference reset reports {@code resetAtmItm=true}; every other cycle reports
@@ -105,10 +106,21 @@ public class PremiumReferenceService {
     // only needs PaperTradingService for the occasional hasOpenPosition() check below, never during
     // construction, so a lazy proxy here is sufficient and avoids Spring's "dependencies form a cycle" error.
     public PremiumReferenceService(GreeksCacheService greeksCacheService, DataSource dataSource,
-                                    @Lazy PaperTradingService paperTradingService) {
+                                    @Lazy PaperTradingService paperTradingService, AngelOneProperties properties) {
         this.greeksCacheService = greeksCacheService;
         this.jdbcTemplate = new JdbcTemplate(dataSource);
         this.paperTradingService = paperTradingService;
+        this.properties = properties;
+    }
+
+    /** Rolling reference recapture interval, driven by the same {@code angelone.atm-itm-reselect-minutes}
+     * property as {@code TradingApplication}'s ATM/ITM strike re-selection, so the two always stay in
+     * sync instead of drifting apart on independent timers. Returns {@code null} when that property is
+     * {@code <= 0}, meaning periodic recapture is disabled entirely (only the initial day/rolling
+     * capture and ATM/ITM-triggered {@link #resetRollingReference()} calls still apply). */
+    private Duration rollingInterval() {
+        int minutes = properties.getAtmItmReselectMinutes();
+        return minutes <= 0 ? null : Duration.ofMinutes(minutes);
     }
 
     /** Creates the {@code premium_reference} table if needed, then restores today's day/rolling
@@ -252,8 +264,9 @@ public class PremiumReferenceService {
 
         boolean dayReferenceMissingToday = dayReferenceDate == null || !dayReferenceDate.equals(today);
         boolean rollingReferenceMissingToday = rollingReferenceDate == null || !rollingReferenceDate.equals(today);
-        boolean rollingIntervalElapsed = !rollingReferenceMissingToday
-                && Duration.between(rollingReference.time(), snapshot.tickTime()).compareTo(ROLLING_INTERVAL) >= 0;
+        Duration rollingInterval = rollingInterval();
+        boolean rollingIntervalElapsed = !rollingReferenceMissingToday && rollingInterval != null
+                && Duration.between(rollingReference.time(), snapshot.tickTime()).compareTo(rollingInterval) >= 0;
 
         if (!dayReferenceMissingToday && !rollingReferenceMissingToday && !rollingIntervalElapsed) {
             return;

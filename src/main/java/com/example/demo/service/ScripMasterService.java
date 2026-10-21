@@ -8,7 +8,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -45,7 +47,12 @@ public class ScripMasterService {
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofMinutes(8))
+            .version(HttpClient.Version.HTTP_1_1)
             .build();
+    private static final int DOWNLOAD_MAX_ATTEMPTS = 40;
+    private static final int DOWNLOAD_MAX_NO_PROGRESS_ATTEMPTS = 6;
+    private static final Duration DOWNLOAD_RETRY_DELAY = Duration.ofSeconds(2);
+    private static final Duration DOWNLOAD_MAX_RETRY_DELAY = Duration.ofSeconds(15);
     private final ReentrantLock lock = new ReentrantLock();
 
     private volatile List<OptionContract> cachedNiftyOptions;
@@ -309,23 +316,99 @@ public class ScripMasterService {
     private String download() {
         log.info("Downloading Angel One Scrip Master from {}", properties.getScripMasterUrl());
 
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(properties.getScripMasterUrl()))
-                .timeout(Duration.ofMinutes(8))
-                .GET()
-                .build();
+        URI uri = URI.create(properties.getScripMasterUrl());
+        ByteArrayOutputStream accumulated = new ByteArrayOutputStream();
+        boolean rangeRequestsSupported = true;
+        Exception lastFailure = null;
+        int consecutiveNoProgress = 0;
+        long expectedTotalBytes = -1;
+        String validator = null; // ETag (preferred) or Last-Modified, used as If-Range to detect a changed file mid-download
 
-        try {
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() != 200) {
-                throw new IllegalStateException("Scrip Master download failed with HTTP " + response.statusCode());
+        for (int attempt = 1; attempt <= DOWNLOAD_MAX_ATTEMPTS; attempt++) {
+            long bytesSoFar = accumulated.size();
+            HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
+                    .uri(uri)
+                    .timeout(Duration.ofMinutes(8))
+                    .GET();
+            boolean resuming = bytesSoFar > 0 && rangeRequestsSupported;
+            if (resuming) {
+                requestBuilder.header("Range", "bytes=" + bytesSoFar + "-");
+                if (validator != null) {
+                    // If the file changed since the first chunk, the server must ignore Range and resend
+                    // the full body (200) instead of a stale partial chunk, so we restart cleanly below
+                    // rather than silently splicing together bytes from two different file versions.
+                    requestBuilder.header("If-Range", validator);
+                }
             }
-            return response.body();
-        } catch (IllegalStateException ex) {
-            throw ex;
-        } catch (Exception ex) {
-            throw new IllegalStateException("Failed to download Angel One Scrip Master: " + ex.getMessage(), ex);
+
+            try {
+                HttpResponse<InputStream> response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofInputStream());
+                int status = response.statusCode();
+
+                if (resuming && status == 200) {
+                    // Server ignored the Range header (or the file changed, failing If-Range) and is
+                    // sending the full body again; discard what we had and restart from scratch.
+                    log.warn("Scrip Master resume request returned full HTTP 200 instead of 206 (file may have changed); restarting download from scratch");
+                    rangeRequestsSupported = false;
+                    accumulated.reset();
+                    expectedTotalBytes = -1;
+                    validator = null;
+                } else if (resuming && status != 206) {
+                    throw new IllegalStateException("Scrip Master resume request failed with HTTP " + status);
+                } else if (!resuming && status != 200) {
+                    throw new IllegalStateException("Scrip Master download failed with HTTP " + status);
+                }
+
+                if (!resuming || status == 200) {
+                    expectedTotalBytes = response.headers().firstValueAsLong("Content-Length").orElse(-1);
+                    validator = response.headers().firstValue("ETag")
+                            .or(() -> response.headers().firstValue("Last-Modified"))
+                            .orElse(null);
+                }
+
+                try (InputStream in = response.body()) {
+                    in.transferTo(accumulated);
+                }
+
+                if (expectedTotalBytes >= 0 && accumulated.size() != expectedTotalBytes) {
+                    // Connection closed "cleanly" from the client's point of view but short of the
+                    // expected size: treat as a failed attempt and retry/resume rather than silently
+                    // returning (and caching) a truncated file.
+                    throw new IOException("Incomplete download: received " + accumulated.size()
+                            + " of expected " + expectedTotalBytes + " bytes");
+                }
+                return accumulated.toString(StandardCharsets.UTF_8);
+            } catch (IllegalStateException ex) {
+                throw ex;
+            } catch (Exception ex) {
+                lastFailure = ex;
+                long gained = accumulated.size() - bytesSoFar;
+                consecutiveNoProgress = gained > 0 ? 0 : consecutiveNoProgress + 1;
+                log.warn("Scrip Master download attempt {}/{} failed after {} bytes total (+{} this attempt): {}",
+                        attempt, DOWNLOAD_MAX_ATTEMPTS, accumulated.size(), gained, ex.getMessage());
+
+                if (consecutiveNoProgress >= DOWNLOAD_MAX_NO_PROGRESS_ATTEMPTS) {
+                    throw new IllegalStateException("Failed to download Angel One Scrip Master: no progress after "
+                            + consecutiveNoProgress + " consecutive attempts, got " + accumulated.size() + " bytes", ex);
+                }
+                if (attempt < DOWNLOAD_MAX_ATTEMPTS) {
+                    try {
+                        // Backoff scales with *consecutive no-progress* attempts, not the raw attempt
+                        // count: an attempt that's still gaining bytes (progress toward the full file)
+                        // retries almost immediately, while a truly stuck run (e.g. the server resetting
+                        // the connection before any data arrives) backs off further each time.
+                        long delayMillis = consecutiveNoProgress == 0
+                                ? DOWNLOAD_RETRY_DELAY.toMillis()
+                                : Math.min(DOWNLOAD_RETRY_DELAY.toMillis() * consecutiveNoProgress, DOWNLOAD_MAX_RETRY_DELAY.toMillis());
+                        Thread.sleep(delayMillis);
+                    } catch (InterruptedException interruptedEx) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException("Failed to download Angel One Scrip Master: interrupted during retry", interruptedEx);
+                    }
+                }
+            }
         }
+        throw new IllegalStateException("Failed to download Angel One Scrip Master: " + lastFailure.getMessage(), lastFailure);
     }
 }
 

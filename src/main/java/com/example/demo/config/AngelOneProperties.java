@@ -55,8 +55,10 @@ public class AngelOneProperties {
     private int itmDepth = 1;
     private int tickHistorySize = 500;
     /** How often (in minutes) ATM CE/PE and FIXED ITM CE/PE are re-selected from the live spot price
-     * during market hours; strikes are held fixed for the rest of each window. Kept in sync with
-     * {@code PremiumReferenceService}'s 30-minute rolling reference by default. */
+     * during market hours; strikes are held fixed for the rest of each window. Also drives
+     * {@code PremiumReferenceService}'s rolling reference recapture interval, so the two stay in sync.
+     * A value {@code <= 0} disables periodic re-selection/recapture entirely (strikes/reference picked
+     * at pipeline start are held fixed for the rest of the day). */
     private int atmItmReselectMinutes = 30;
 
     public int getAtmItmReselectMinutes() {

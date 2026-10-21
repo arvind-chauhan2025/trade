@@ -23,6 +23,12 @@ public class SupportResistanceProperties {
      * Support/Resistance zone. */
     private double zoneTolerancePoints = 20.0;
 
+    /** Maximum number of previous trading sessions (excluding the current one) to progressively search
+     * for previous-session High/Low/Close levels when the current session alone doesn't yield at least 2
+     * valid Support and 2 valid Resistance zones near the current spot. Sessions are derived from which
+     * trade dates actually have persisted candles, so weekends/holidays are skipped automatically. */
+    private int maxPreviousSessions = 5;
+
     public int getPivotWindow() {
         return pivotWindow;
     }
@@ -37,5 +43,13 @@ public class SupportResistanceProperties {
 
     public void setZoneTolerancePoints(double zoneTolerancePoints) {
         this.zoneTolerancePoints = zoneTolerancePoints;
+    }
+
+    public int getMaxPreviousSessions() {
+        return maxPreviousSessions;
+    }
+
+    public void setMaxPreviousSessions(int maxPreviousSessions) {
+        this.maxPreviousSessions = maxPreviousSessions;
     }
 }

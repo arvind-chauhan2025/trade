@@ -217,8 +217,14 @@ public class TradingApplication implements ApplicationRunner {
         if (!pipelineActive.get()) {
             return;
         }
+        int reselectMinutes = properties.getAtmItmReselectMinutes();
+        if (reselectMinutes <= 0) {
+            // 0 (or negative) disables periodic ATM/ITM re-selection entirely: strikes picked at
+            // pipeline startup are held for the rest of the day instead of rolling every N minutes.
+            return;
+        }
         Instant last = lastAtmItmSelectionAt;
-        Duration window = Duration.ofMinutes(Math.max(1, properties.getAtmItmReselectMinutes()));
+        Duration window = Duration.ofMinutes(reselectMinutes);
         if (last == null || Duration.between(last, Instant.now()).compareTo(window) < 0) {
             return;
         }

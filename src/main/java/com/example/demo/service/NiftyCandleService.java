@@ -153,6 +153,24 @@ public class NiftyCandleService {
                 .toList();
     }
 
+    /** Returns up to {@code maxCount} distinct trade dates strictly before {@code beforeDate} that have at
+     * least one persisted 5-minute candle, ordered most-recent-first. Used by
+     * {@link SupportResistanceService}'s progressive historical lookback: trading sessions (as opposed to
+     * calendar days) are derived purely from which dates actually have candle data, so weekends and
+     * holidays are skipped automatically without a separate trading calendar, and the result is naturally
+     * empty (not fabricated) when no older data is available. */
+    public List<LocalDate> getPreviousTradingDates(LocalDate beforeDate, int maxCount) {
+        if (maxCount <= 0) {
+            return List.of();
+        }
+        return jdbcTemplate.query("""
+                        SELECT DISTINCT trade_date FROM nifty_candle_5m WHERE trade_date < ?
+                        ORDER BY trade_date DESC LIMIT ?
+                        """,
+                (rs, rowNum) -> rs.getObject("trade_date", LocalDate.class),
+                beforeDate, maxCount);
+    }
+
     /** Returns every completed 5-minute candle persisted for any trade date in {@code [fromDate, toDate]}
      * (inclusive on both ends), ordered chronologically (date, then interval). */
     public List<NiftyCandle> getCandles(LocalDate fromDate, LocalDate toDate) {
