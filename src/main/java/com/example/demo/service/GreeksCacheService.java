@@ -1,14 +1,19 @@
 package com.example.demo.service;
 
 import com.example.demo.config.MockGreeksProperties;
+import com.example.demo.dto.GreekHistoryEntry;
 import com.example.demo.dto.OptionContract;
 import com.example.demo.dto.OptionGreek;
+import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Service;
 
+import javax.sql.DataSource;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -31,21 +36,48 @@ public class GreeksCacheService {
 
     private final AngelOneOptionGreeksService greeksService;
     private final MockGreeksProperties mockGreeksProperties;
+    private final JdbcTemplate jdbcTemplate;
     private final ConcurrentHashMap<String, OptionGreek> greeksByLabel = new ConcurrentHashMap<>();
 
-    public GreeksCacheService(AngelOneOptionGreeksService greeksService, MockGreeksProperties mockGreeksProperties) {
+    public GreeksCacheService(AngelOneOptionGreeksService greeksService, MockGreeksProperties mockGreeksProperties,
+                               DataSource dataSource) {
         this.greeksService = greeksService;
         this.mockGreeksProperties = mockGreeksProperties;
+        this.jdbcTemplate = new JdbcTemplate(dataSource);
+    }
+
+    /** Creates the {@code option_greeks} history table if needed. Every refresh (real or mock) appends a
+     * new row per label instead of overwriting the previous one, so the full history of how a label's
+     * Greeks evolved through the day is preserved for later analysis. */
+    @PostConstruct
+    void init() {
+        jdbcTemplate.execute("""
+                CREATE TABLE IF NOT EXISTS option_greeks (
+                    tick_date DATE NOT NULL,
+                    tick_time VARCHAR(16) NOT NULL,
+                    label VARCHAR(32) NOT NULL,
+                    captured_at TIMESTAMP NOT NULL DEFAULT now(),
+                    strike DOUBLE PRECISION NOT NULL,
+                    option_type VARCHAR(4) NOT NULL,
+                    delta DOUBLE PRECISION NOT NULL,
+                    gamma DOUBLE PRECISION NOT NULL,
+                    theta DOUBLE PRECISION NOT NULL,
+                    vega DOUBLE PRECISION NOT NULL,
+                    implied_volatility DOUBLE PRECISION NOT NULL
+                )
+                """);
     }
 
     /**
      * Updates the cached Greek set for each labeled contract for {@code expiry}. If
      * {@code greeks.mock.enabled=true}, synthesizes Greeks locally from the configured mock values;
      * otherwise fetches real Greeks from Angel One and matches by exact strike + option type.
+     * {@code tickTime} is accepted from the caller (rather than each persisted row stamping its own time)
+     * so every label's Greek from this single refresh is persisted with the exact same tick time.
      */
-    public void refresh(LocalDate expiry, Map<String, OptionContract> trackedContracts) {
+    public void refresh(LocalDate expiry, Map<String, OptionContract> trackedContracts, String tickTime) {
         if (mockGreeksProperties.isEnabled()) {
-            refreshWithMockData(expiry, trackedContracts);
+            refreshWithMockData(expiry, trackedContracts, tickTime);
             return;
         }
 
@@ -58,6 +90,7 @@ public class GreeksCacheService {
                 .ifPresentOrElse(
                         g -> {
                             greeksByLabel.put(label, g);
+                            persistGreek(label, g, tickTime);
                             log.info("{} Delta={} Gamma={} Theta={} (strike={}, expiry={})",
                                     label, g.delta(), g.gamma(), g.theta(), contract.strike(), expiry);
                         },
@@ -68,7 +101,7 @@ public class GreeksCacheService {
     /** Synthesizes an {@link OptionGreek} per tracked label from {@link MockGreeksProperties}, using each
      * contract's real strike/optionType but configured mock Delta/Gamma/Theta/Vega/IV. Delta's sign
      * follows the option type (positive for CE, negative for PE), matching real-world convention. */
-    private void refreshWithMockData(LocalDate expiry, Map<String, OptionContract> trackedContracts) {
+    private void refreshWithMockData(LocalDate expiry, Map<String, OptionContract> trackedContracts, String tickTime) {
         log.info("greeks.mock.enabled=true; synthesizing mock Greeks for expiry={} instead of calling Angel One", expiry);
         trackedContracts.forEach((label, contract) -> {
             boolean isCall = contract.optionType().equalsIgnoreCase("CE");
@@ -78,9 +111,50 @@ public class GreeksCacheService {
                     delta, mockGreeksProperties.getGamma(), mockGreeksProperties.getTheta(),
                     mockGreeksProperties.getVega(), mockGreeksProperties.getImpliedVolatility());
             greeksByLabel.put(label, mock);
+            persistGreek(label, mock, tickTime);
             log.info("{} (mock) Delta={} Gamma={} Theta={} (strike={}, expiry={})",
                     label, mock.delta(), mock.gamma(), mock.theta(), contract.strike(), expiry);
         });
+    }
+
+    /** Appends one history row for {@code label}'s just-refreshed {@link OptionGreek} into the
+     * {@code option_greeks} table, stamped with {@code tickTime} (shared across every label persisted in
+     * the same {@link #refresh} call). Persistence failures are logged and swallowed so a DB hiccup never
+     * breaks the in-memory cache refresh that callers depend on. */
+    private void persistGreek(String label, OptionGreek greek, String tickTime) {
+        try {
+            jdbcTemplate.update("""
+                    INSERT INTO option_greeks (
+                        tick_date, tick_time, label, strike, option_type, delta, gamma, theta, vega, implied_volatility
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    LocalDate.now(), tickTime, label, greek.strike(), greek.optionType(),
+                    greek.delta(), greek.gamma(), greek.theta(), greek.vega(), greek.impliedVolatility());
+        } catch (Exception ex) {
+            log.warn("Failed to persist Greeks history for {}", label, ex);
+        }
+    }
+
+    private static final RowMapper<GreekHistoryEntry> GREEK_HISTORY_ROW_MAPPER = (rs, rowNum) -> new GreekHistoryEntry(
+            rs.getObject("tick_date", LocalDate.class),
+            rs.getString("tick_time"),
+            rs.getString("label"),
+            rs.getObject("captured_at", LocalDateTime.class),
+            new OptionGreek(
+                    rs.getDouble("strike"), rs.getString("option_type"),
+                    rs.getDouble("delta"), rs.getDouble("gamma"), rs.getDouble("theta"),
+                    rs.getDouble("vega"), rs.getDouble("implied_volatility"))
+    );
+
+    /** Returns every persisted {@link GreekHistoryEntry} for {@code label} between {@code fromDate} and
+     * {@code toDate} (inclusive), ordered chronologically by capture time. Use this to inspect how a
+     * tracked label's Greeks evolved over one or more trading days. */
+    public List<GreekHistoryEntry> getHistory(String label, LocalDate fromDate, LocalDate toDate) {
+        return jdbcTemplate.query("""
+                        SELECT tick_date, tick_time, label, captured_at, strike, option_type, delta, gamma, theta, vega, implied_volatility
+                        FROM option_greeks WHERE label = ? AND tick_date BETWEEN ? AND ? ORDER BY captured_at
+                        """,
+                GREEK_HISTORY_ROW_MAPPER, label, fromDate, toDate);
     }
 
     /** Returns the cached Delta for a label (ATM CE, ATM PE, FIXED ITM CE, FIXED ITM PE), or null if unavailable.

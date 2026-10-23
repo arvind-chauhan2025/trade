@@ -20,7 +20,9 @@ import java.util.Map;
  * Pushes {@link TickPersistenceService#getLatestCompleteSnapshot()} to every connected
  * {@code /ws/tick-snapshot} WebSocket client every 5 seconds. Before sending, the raw snapshot is
  * enriched via {@link PremiumReferenceService} with the expected CE/PE premium (Delta+Gamma+Theta from
- * the 9:15 reference) and its divergence from the actual premium. Nothing is sent while no complete
+ * the 9:15 reference) and its divergence from the actual premium, then further enriched in place by
+ * {@link IntervalDivergenceService} with each label's interval-based cumulative divergence (computed from
+ * the live/current Greeks cache rather than a frozen reference). Nothing is sent while no complete
  * snapshot has been produced yet, and disconnected/broken sessions are pruned as they're found.
  * Every enriched snapshot is also pushed onto {@link EnrichedSnapshotPersistenceService} for asynchronous
  * persistence into the {@code enriched_snapshot} table, regardless of whether any client is connected.
@@ -49,6 +51,7 @@ public class TickSnapshotBroadcastService {
     private final MockSnapshotService mockSnapshotService;
     private final MockGreeksProperties mockGreeksProperties;
     private final GreeksCacheService greeksCacheService;
+    private final IntervalDivergenceService intervalDivergenceService;
     private final NiftyCandleService niftyCandleService;
     private final SupportResistanceService supportResistanceService;
     private final PaperTradingService paperTradingService;
@@ -63,6 +66,7 @@ public class TickSnapshotBroadcastService {
                                          MockSnapshotService mockSnapshotService,
                                          MockGreeksProperties mockGreeksProperties,
                                          GreeksCacheService greeksCacheService,
+                                         IntervalDivergenceService intervalDivergenceService,
                                          NiftyCandleService niftyCandleService,
                                          SupportResistanceService supportResistanceService,
                                          PaperTradingService paperTradingService) {
@@ -73,6 +77,7 @@ public class TickSnapshotBroadcastService {
         this.mockSnapshotService = mockSnapshotService;
         this.mockGreeksProperties = mockGreeksProperties;
         this.greeksCacheService = greeksCacheService;
+        this.intervalDivergenceService = intervalDivergenceService;
         this.niftyCandleService = niftyCandleService;
         this.supportResistanceService = supportResistanceService;
         this.paperTradingService = paperTradingService;
@@ -91,7 +96,7 @@ public class TickSnapshotBroadcastService {
             if (mockGreeksProperties.isEnabled()) {
                 // Real Greeks are normally seeded by the live pipeline (TradingApplication); feed mock
                 // Greeks matching the mock snapshot's strikes so they're available here too.
-                greeksCacheService.refresh(LocalDate.now(), mockSnapshotService.currentContracts());
+                greeksCacheService.refresh(LocalDate.now(), mockSnapshotService.currentContracts(), snapshot.tickTime().toString());
             }
             // Real snapshots have their reference captured from TickPersistenceService.offer(); mock
             // snapshots bypass that path entirely, so prime/refresh the reference here instead. Ignore
@@ -106,6 +111,7 @@ public class TickSnapshotBroadcastService {
         }
 
         Map<String, Object> enriched = premiumReferenceService.enrich(snapshot);
+        intervalDivergenceService.onEnrichedSnapshot(enriched);
         enrichedSnapshotPersistenceService.offer(enriched);
         //paperTradingService.onSnapshot(snapshot, enriched);
 

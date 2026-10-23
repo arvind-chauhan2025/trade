@@ -14,12 +14,16 @@ import com.example.demo.service.ScripMasterService;
 import com.example.demo.service.FixedItmSelectionService;
 import com.example.demo.service.GreeksCacheService;
 import com.example.demo.service.TickPersistenceService;
+import com.example.demo.service.TrackedSelectionPersistenceService;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -70,6 +74,7 @@ public class TradingApplication implements ApplicationRunner {
     private final GreeksCacheService greeksCacheService;
     private final PremiumReferenceService premiumReferenceService;
     private final PaperTradingService paperTradingService;
+    private final TrackedSelectionPersistenceService trackedSelectionPersistenceService;
 
     @Value("${trading.run-on-startup:false}")
     private boolean OnStartup;
@@ -92,7 +97,8 @@ public class TradingApplication implements ApplicationRunner {
                                FixedItmSelectionService fixedItmSelectionService,
                                GreeksCacheService greeksCacheService,
                                PremiumReferenceService premiumReferenceService,
-                               PaperTradingService paperTradingService) {
+                               PaperTradingService paperTradingService,
+                               TrackedSelectionPersistenceService trackedSelectionPersistenceService) {
         this.niftySpotPriceService = niftySpotPriceService;
         this.scripMasterService = scripMasterService;
         this.niftyOptionSelector = niftyOptionSelector;
@@ -103,6 +109,7 @@ public class TradingApplication implements ApplicationRunner {
         this.greeksCacheService = greeksCacheService;
         this.premiumReferenceService = premiumReferenceService;
         this.paperTradingService = paperTradingService;
+        this.trackedSelectionPersistenceService = trackedSelectionPersistenceService;
     }
 
 
@@ -119,9 +126,15 @@ public class TradingApplication implements ApplicationRunner {
         }
     }
 
-    /** Starts the NIFTY streaming pipeline every trading weekday at 9:15 AM IST (market open). Always
-     * (re)computes ATM/FIXED ITM CE/PE from that morning's own spot price — never restored from a
-     * previous day — so the "morning snapshot" baseline is fresh every trading day. */
+    /** Starts the NIFTY streaming pipeline every trading weekday at 9:15 AM IST (market open). On the
+     * first pipeline start of the day, (re)computes ATM/FIXED ITM CE/PE from that morning's own spot
+     * price and persists the selection via {@link TrackedSelectionPersistenceService}. On any later
+     * (re)start the same day (e.g. after a crash/restart), restores and reuses that exact persisted
+     * selection instead of re-deriving (possibly different, since spot has moved) strikes from the
+     * current spot price — so strikes stay pinned across restarts within the same trading day, just as
+     * they would have without the restart. Falls back to a fresh live-spot selection if nothing was
+     * persisted yet, or if a persisted leg's token can no longer be resolved against the freshly loaded
+     * Scrip Master (e.g. a now-missing contract). */
     @Scheduled(cron = "0 15 9 * * MON-FRI", zone = "Asia/Kolkata")
     public void startPipeline() {
         try {
@@ -134,20 +147,53 @@ public class TradingApplication implements ApplicationRunner {
             List<OptionContract> expiryContracts = allContracts.stream()
                     .filter(c -> c.expiry().equals(fixed.expiry())).toList();
             log.info("Selected NIFTY expiry: {}", fixed.expiry());
-            log.info("FIXED ITM CE: symbol={} token={} strike={} expiry={}",
-                    fixed.ce().symbol(), fixed.ce().token(), fixed.ce().strike(), fixed.expiry());
-            log.info("FIXED ITM PE: symbol={} token={} strike={} expiry={}",
-                    fixed.pe().symbol(), fixed.pe().token(), fixed.pe().strike(), fixed.expiry());
 
-            OptionContract atmCe = niftyOptionSelector.selectAtmCe(
-                    spot, expiryContracts, properties.getStrikeStep());
+            OptionContract atmCe;
+            OptionContract atmPe;
+            OptionContract fixedItmCe;
+            OptionContract fixedItmPe;
+            Instant selectionInstant;
+
+            // Restoring (and pinning) today's already-persisted selection across a restart only applies
+            // when periodic re-selection is disabled (atm-itm-reselect-minutes <= 0): that's the only
+            // case where a restart should *not* just recompute from the current live spot like before.
+            // When periodic re-selection is enabled, every (re)start keeps the original behavior of
+            // always deriving fresh strikes from the live spot price.
+            boolean pinningEnabled = properties.getAtmItmReselectMinutes() <= 0;
+            ResolvedSelection resolved = pinningEnabled
+                    ? trackedSelectionPersistenceService.restoreTodaysSelection()
+                            .filter(sel -> sel.expiry().equals(fixed.expiry()))
+                            .flatMap(sel -> resolvePersistedSelection(sel, expiryContracts))
+                            .orElse(null)
+                    : null;
+
+            if (resolved != null) {
+                atmCe = resolved.atmCe();
+                atmPe = resolved.atmPe();
+                fixedItmCe = resolved.fixedItmCe();
+                fixedItmPe = resolved.fixedItmPe();
+                selectionInstant = resolved.selectedAt();
+                log.info("Restored today's already-persisted ATM/ITM selection (selected at {}); strikes stay pinned across this restart",
+                        selectionInstant);
+            } else {
+                atmCe = niftyOptionSelector.selectAtmCe(spot, expiryContracts, properties.getStrikeStep());
+                atmPe = niftyOptionSelector.selectAtmPe(spot, expiryContracts, properties.getStrikeStep());
+                fixedItmCe = fixed.ce();
+                fixedItmPe = fixed.pe();
+                selectionInstant = Instant.now();
+                if (pinningEnabled) {
+                    trackedSelectionPersistenceService.persist(selectionInstant, fixed.expiry(), atmCe, atmPe, fixedItmCe, fixedItmPe);
+                }
+            }
+
             log.info("ATM CE selected: symbol={} token={} strike={} expiry={}",
                     atmCe.symbol(), atmCe.token(), atmCe.strike(), atmCe.expiry());
-
-            OptionContract atmPe = niftyOptionSelector.selectAtmPe(
-                    spot, expiryContracts, properties.getStrikeStep());
             log.info("ATM PE selected: symbol={} token={} strike={} expiry={}",
                     atmPe.symbol(), atmPe.token(), atmPe.strike(), atmPe.expiry());
+            log.info("FIXED ITM CE: symbol={} token={} strike={} expiry={}",
+                    fixedItmCe.symbol(), fixedItmCe.token(), fixedItmCe.strike(), fixedItmCe.expiry());
+            log.info("FIXED ITM PE: symbol={} token={} strike={} expiry={}",
+                    fixedItmPe.symbol(), fixedItmPe.token(), fixedItmPe.strike(), fixedItmPe.expiry());
 
             OptionContract niftyFut = scripMasterService.getNearestNiftyFuture();
             log.info("NIFTY FUT selected: symbol={} token={} expiry={}",
@@ -160,23 +206,62 @@ public class TradingApplication implements ApplicationRunner {
             trackedExpiryContracts = expiryContracts;
             trackedContracts = Map.of(
                     "ATM CE", atmCe, "ATM PE", atmPe,
-                    "FIXED ITM CE", fixed.ce(), "FIXED ITM PE", fixed.pe());
-            lastAtmItmSelectionAt = Instant.now();
-            premiumReferenceService.setExpectedStrikes(atmCe, atmPe, fixed.ce(), fixed.pe());
-            premiumReferenceService.resetRollingReferenceIfStaleFor(atmCe, atmPe, fixed.ce(), fixed.pe());
+                    "FIXED ITM CE", fixedItmCe, "FIXED ITM PE", fixedItmPe);
+            lastAtmItmSelectionAt = selectionInstant;
+            premiumReferenceService.setExpectedStrikes(atmCe, atmPe, fixedItmCe, fixedItmPe);
+            premiumReferenceService.resetRollingReferenceIfStaleFor(atmCe, atmPe, fixedItmCe, fixedItmPe);
 
             try {
-                greeksCacheService.refresh(trackedExpiry, trackedContracts);
+                greeksCacheService.refresh(trackedExpiry, trackedContracts, currentTickTime());
             } catch (Exception ex) {
                 log.warn("Failed to fetch Option Greeks; Delta will be unavailable for this session", ex);
             }
 
-            angelOneMarketDataService.start(jwtToken, feedToken, atmCe, atmPe, fixed.ce(), fixed.pe(), niftyFut);
+            angelOneMarketDataService.start(jwtToken, feedToken, atmCe, atmPe, fixedItmCe, fixedItmPe, niftyFut);
             pipelineActive.set(true);
             log.info("SmartStream subscription initiated for NIFTY, ATM CE/PE, fixed ITM CE/PE and NIFTY FUT");
         } catch (Exception ex) {
             log.error("Failed to bootstrap NIFTY trading pipeline", ex);
         }
+    }
+
+    private record ResolvedSelection(Instant selectedAt, OptionContract atmCe, OptionContract atmPe,
+                                      OptionContract fixedItmCe, OptionContract fixedItmPe) {
+    }
+
+    /** Resolves each leg of a {@link TrackedSelectionPersistenceService.PersistedSelection} to the
+     * matching live {@link OptionContract} (by token) out of the freshly-loaded {@code expiryContracts}.
+     * Returns empty if any leg's token can no longer be found, so the caller falls back to a fresh
+     * live-spot selection instead of starting with an incomplete/stale one. */
+    private Optional<ResolvedSelection> resolvePersistedSelection(TrackedSelectionPersistenceService.PersistedSelection selection,
+                                                                    List<OptionContract> expiryContracts) {
+        OptionContract atmCe = findByToken(expiryContracts, selection.atmCe().token());
+        OptionContract atmPe = findByToken(expiryContracts, selection.atmPe().token());
+        OptionContract fixedItmCe = findByToken(expiryContracts, selection.fixedItmCe().token());
+        OptionContract fixedItmPe = findByToken(expiryContracts, selection.fixedItmPe().token());
+        if (atmCe == null || atmPe == null || fixedItmCe == null || fixedItmPe == null) {
+            log.warn("Persisted tracked selection references a contract no longer present in today's Scrip "
+                    + "Master; falling back to a fresh live-spot selection instead");
+            return Optional.empty();
+        }
+        return Optional.of(new ResolvedSelection(selection.selectedAt(), atmCe, atmPe, fixedItmCe, fixedItmPe));
+    }
+
+    private OptionContract findByToken(List<OptionContract> contracts, String token) {
+        return contracts.stream().filter(c -> c.token().equals(token)).findFirst().orElse(null);
+    }
+
+    /** Resolves a single tick time to stamp all Greeks from one {@link GreeksCacheService#refresh} call
+     * with, so every label refreshed together shares the exact same tick time instead of each drifting a
+     * few milliseconds apart. Prefers the latest complete live {@link TickSnapshot}'s own tick time (so
+     * the Greeks history row lines up with the matching {@code ticks}/{@code tick_snapshot} row); falls
+     * back to the current wall-clock time (e.g. right at pipeline startup, before any tick has arrived
+     * yet) when no complete snapshot exists. */
+    private String currentTickTime() {
+        TickSnapshot latest = TickPersistenceService.getLatestCompleteSnapshot();
+        return latest != null
+                ? latest.tickTime().toString()
+                : LocalTime.now(IST).format(DateTimeFormatter.ofPattern("HH:mm:ss"));
     }
 
     /** Refreshes the cached Option Greeks/Delta every 30 seconds while the pipeline is active. */
@@ -191,7 +276,7 @@ public class TradingApplication implements ApplicationRunner {
             return;
         }
         try {
-            greeksCacheService.refresh(expiry, contracts);
+            greeksCacheService.refresh(expiry, contracts, currentTickTime());
         } catch (Exception ex) {
             log.warn("Failed to refresh Option Greeks", ex);
         }
@@ -265,12 +350,15 @@ public class TradingApplication implements ApplicationRunner {
                         "ATM CE", newAtmCe, "ATM PE", newAtmPe,
                         "FIXED ITM CE", newItm.ce(), "FIXED ITM PE", newItm.pe());
                 try {
-                    greeksCacheService.refresh(expiry, trackedContracts);
+                    greeksCacheService.refresh(expiry, trackedContracts, currentTickTime());
                 } catch (Exception ex) {
                     log.warn("Failed to refresh Option Greeks after rolling ATM/ITM re-selection", ex);
                 }
                 premiumReferenceService.setExpectedStrikes(newAtmCe, newAtmPe, newItm.ce(), newItm.pe());
                 premiumReferenceService.resetRollingReference();
+                // Persist this new selection as today's current pin, so a same-day restart before the
+                // *next* rolling window restores these (newer) strikes instead of the original 9:15 ones.
+                trackedSelectionPersistenceService.persist(Instant.now(), expiry, newAtmCe, newAtmPe, newItm.ce(), newItm.pe());
             } else {
                 log.debug("30-min rolling window elapsed (spot={}); ATM/ITM strikes unchanged", spot);
             }
