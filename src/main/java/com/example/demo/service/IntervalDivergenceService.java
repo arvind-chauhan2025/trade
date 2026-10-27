@@ -1,6 +1,7 @@
 package com.example.demo.service;
 
 import com.example.demo.dto.OptionGreek;
+import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -41,6 +42,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * one interval spanning the swap is skipped (comparing a premium under the old strike against the new
  * strike's premium would be meaningless) and that label's baseline is simply resynced to the new strike's
  * current premium instead.
+ * <p>
+ * Every baseline update (resync or divergence-bearing) is durably persisted per label, per trading day, via
+ * {@link IntervalDivergencePersistenceService}; on startup, {@link #restoreTodaysState()} reloads today's
+ * rows (if any), so a same-day restart resumes from the exact baseline/cumulative total it left off at
+ * rather than silently resetting to zero.
  */
 @Service
 public class IntervalDivergenceService {
@@ -55,6 +61,7 @@ public class IntervalDivergenceService {
             "fixedItmCeCumulativeDivergence", "fixedItmPeCumulativeDivergence"};
 
     private final GreeksCacheService greeksCacheService;
+    private final IntervalDivergencePersistenceService persistenceService;
 
     /** This label's snapshot (premium, NIFTY spot, strike, tick time) as of the last interval for which a
      * divergence was actually calculated (or, for a brand-new/just-reset label, the baseline to measure
@@ -66,8 +73,28 @@ public class IntervalDivergenceService {
     private final Map<String, Double> cumulativeDivergenceByLabel = new ConcurrentHashMap<>();
     private volatile LocalDate currentDay;
 
-    public IntervalDivergenceService(GreeksCacheService greeksCacheService) {
+    public IntervalDivergenceService(GreeksCacheService greeksCacheService,
+                                      IntervalDivergencePersistenceService persistenceService) {
         this.greeksCacheService = greeksCacheService;
+        this.persistenceService = persistenceService;
+    }
+
+    /** Restores today's baseline/cumulative state (if any was already persisted, e.g. this is a same-day
+     * restart) so an application restart doesn't silently reset cumulative divergence to zero and
+     * re-baseline from whatever premium happens to be live at restart time. */
+    @PostConstruct
+    void restoreTodaysState() {
+        Map<String, IntervalDivergencePersistenceService.PersistedLabelState> restored = persistenceService.restoreToday();
+        if (restored.isEmpty()) {
+            return;
+        }
+        currentDay = LocalDate.now();
+        restored.forEach((label, state) -> {
+            previousByLabel.put(label, new LabelSnapshot(state.premium(), state.spot(), state.strike(), state.time()));
+            cumulativeDivergenceByLabel.put(label, state.cumulativeDivergence());
+        });
+        log.info("IntervalDivergenceService: restored persisted interval divergence state for {} label(s) for {}",
+                restored.size(), currentDay);
     }
 
     /** Computes this cycle's interval divergence for each of the four tracked labels from {@code enriched}
@@ -115,6 +142,8 @@ public class IntervalDivergenceService {
             // re-selection): resync the baseline to the current strike/premium without computing a
             // divergence for this interval, and leave the cumulative total untouched.
             previousByLabel.put(label, new LabelSnapshot(currentPremium, spot, currentStrike, tickTime));
+            persistenceService.persist(label, currentPremium, spot, currentStrike, tickTime,
+                    cumulativeDivergenceByLabel.getOrDefault(label, 0.0));
             return;
         }
 
@@ -137,6 +166,8 @@ public class IntervalDivergenceService {
 
         cumulativeDivergenceByLabel.merge(label, intervalDivergence, Double::sum);
         previousByLabel.put(label, new LabelSnapshot(currentPremium, spot, currentStrike, tickTime));
+        persistenceService.persist(label, currentPremium, spot, currentStrike, tickTime,
+                cumulativeDivergenceByLabel.getOrDefault(label, 0.0));
     }
 
     private void mergeCumulativeValues(Map<String, Object> enriched) {
