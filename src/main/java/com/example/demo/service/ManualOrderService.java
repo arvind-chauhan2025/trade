@@ -72,8 +72,9 @@ public class ManualOrderService {
 
         double entryValue = premium * LOT_SIZE * lots;
         long id = persistenceService.insertOpen(label, moneyness.toUpperCase(), optionTypeCode(optionType), lots,
-                LOT_SIZE, greek.strike(), snapshot.tickTime(), premium, entryValue);
-        log.info("Manual order placed: id={} label={} lots={} strike={} premium={}", id, label, lots, greek.strike(), premium);
+                LOT_SIZE, greek.strike(), snapshot.tickTime(), premium, entryValue, snapshot.nifty());
+        log.info("Manual order placed: id={} label={} lots={} strike={} premium={} spot={}", id, label, lots,
+                greek.strike(), premium, snapshot.nifty());
         return persistenceService.getById(id).orElseThrow();
     }
 
@@ -99,10 +100,16 @@ public class ManualOrderService {
         }
 
         double exitValue = premium * open.quantity();
-        double pnl = (premium - open.entryPremium()) * open.quantity();
-        persistenceService.closeOrder(orderId, snapshot.tickTime(), premium, exitValue, pnl);
-        log.info("Manual order exited: id={} label={} exitPremium={} pnl={}", orderId, open.label(), premium, pnl);
+        double pnl = round2((premium - open.entryPremium()) * open.quantity());
+        persistenceService.closeOrder(orderId, snapshot.tickTime(), premium, exitValue, snapshot.nifty(), pnl);
+        log.info("Manual order exited: id={} label={} exitPremium={} spot={} pnl={}", orderId, open.label(), premium,
+                snapshot.nifty(), pnl);
         return persistenceService.getById(orderId).orElseThrow();
+    }
+
+    /** Rounds a P&amp;L value to exactly 2 decimal places (half-up). */
+    private double round2(double value) {
+        return Math.round(value * 100.0) / 100.0;
     }
 
     /** Returns the currently open manual order, if any. */

@@ -51,41 +51,49 @@ public class ManualOrderPersistenceService {
                     entry_time VARCHAR(18) NOT NULL,
                     entry_premium DOUBLE PRECISION NOT NULL,
                     entry_value DOUBLE PRECISION NOT NULL,
+                    entry_spot DOUBLE PRECISION,
                     exit_time VARCHAR(18),
                     exit_premium DOUBLE PRECISION,
                     exit_value DOUBLE PRECISION,
+                    exit_spot DOUBLE PRECISION,
                     pnl DOUBLE PRECISION,
                     created_at TIMESTAMP NOT NULL DEFAULT now()
                 )
                 """);
+        jdbcTemplate.execute("ALTER TABLE manual_order ADD COLUMN IF NOT EXISTS entry_spot DOUBLE PRECISION");
+        jdbcTemplate.execute("ALTER TABLE manual_order ADD COLUMN IF NOT EXISTS exit_spot DOUBLE PRECISION");
     }
 
-    /** Inserts a newly opened manual order and returns its generated id. */
+    /** Inserts a newly opened manual order and returns its generated id. {@code entrySpot} is the live
+     * NIFTY index price at the moment of entry, saved purely for reference alongside the option premium. */
     public long insertOpen(String label, String moneyness, String optionType, int lots, int lotSize,
-                            double strike, LocalTime entryTime, double entryPremium, double entryValue) {
+                            double strike, LocalTime entryTime, double entryPremium, double entryValue,
+                            Double entrySpot) {
         int quantity = lots * lotSize;
         Long id = jdbcTemplate.queryForObject("""
                 INSERT INTO manual_order (
                     trade_date, label, moneyness, option_type, lots, lot_size, quantity, strike, status,
-                    entry_time, entry_premium, entry_value
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?)
+                    entry_time, entry_premium, entry_value, entry_spot
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)
                 RETURNING id
                 """, Long.class,
                 LocalDate.now(), label, moneyness, optionType, lots, lotSize, quantity, strike,
-                entryTime.toString(), entryPremium, entryValue);
-        log.info("Manual order OPENED id={} label={} lots={} quantity={} strike={} entryPremium={} entryValue={}",
-                id, label, lots, quantity, strike, entryPremium, entryValue);
+                entryTime.toString(), entryPremium, entryValue, entrySpot);
+        log.info("Manual order OPENED id={} label={} lots={} quantity={} strike={} entryPremium={} entryValue={} entrySpot={}",
+                id, label, lots, quantity, strike, entryPremium, entryValue, entrySpot);
         return id;
     }
 
-    /** Closes a manual order with the exit premium/value and computed P&amp;L. */
-    public void closeOrder(long id, LocalTime exitTime, double exitPremium, double exitValue, double pnl) {
+    /** Closes a manual order with the exit premium/value, the live NIFTY index price at exit
+     * ({@code exitSpot}), and computed P&amp;L (rounded to 2 decimal places). */
+    public void closeOrder(long id, LocalTime exitTime, double exitPremium, double exitValue, Double exitSpot, double pnl) {
         jdbcTemplate.update("""
-                UPDATE manual_order SET status = 'CLOSED', exit_time = ?, exit_premium = ?, exit_value = ?, pnl = ?
+                UPDATE manual_order SET status = 'CLOSED', exit_time = ?, exit_premium = ?, exit_value = ?,
+                    exit_spot = ?, pnl = ?
                 WHERE id = ?
-                """, exitTime.toString(), exitPremium, exitValue, pnl, id);
-        log.info("Manual order CLOSED id={} exitTime={} exitPremium={} exitValue={} pnl={}",
-                id, exitTime, exitPremium, exitValue, pnl);
+                """, exitTime.toString(), exitPremium, exitValue, exitSpot, pnl, id);
+        log.info("Manual order CLOSED id={} exitTime={} exitPremium={} exitValue={} exitSpot={} pnl={}",
+                id, exitTime, exitPremium, exitValue, exitSpot, pnl);
     }
 
     /** Returns the currently open manual order (if any) — only one may be open at a time. */
@@ -115,8 +123,8 @@ public class ManualOrderPersistenceService {
     public record ManualOrderSummary(
             long id, LocalDate tradeDate, String label, String moneyness, String optionType,
             int lots, int lotSize, int quantity, double strike, String status,
-            LocalTime entryTime, double entryPremium, double entryValue,
-            LocalTime exitTime, Double exitPremium, Double exitValue, Double pnl,
+            LocalTime entryTime, double entryPremium, double entryValue, Double entrySpot,
+            LocalTime exitTime, Double exitPremium, Double exitValue, Double exitSpot, Double pnl,
             LocalDateTime createdAt) {
     }
 
@@ -128,9 +136,10 @@ public class ManualOrderPersistenceService {
                 rs.getString("moneyness"), rs.getString("option_type"),
                 rs.getInt("lots"), rs.getInt("lot_size"), rs.getInt("quantity"), rs.getDouble("strike"),
                 rs.getString("status"), LocalTime.parse(rs.getString("entry_time")),
-                rs.getDouble("entry_premium"), rs.getDouble("entry_value"),
+                rs.getDouble("entry_premium"), rs.getDouble("entry_value"), nullableDouble(rs, "entry_spot"),
                 exitTime != null ? LocalTime.parse(exitTime) : null,
-                nullableDouble(rs, "exit_premium"), nullableDouble(rs, "exit_value"), nullableDouble(rs, "pnl"),
+                nullableDouble(rs, "exit_premium"), nullableDouble(rs, "exit_value"), nullableDouble(rs, "exit_spot"),
+                nullableDouble(rs, "pnl"),
                 createdAt != null ? createdAt.toLocalDateTime() : null);
     }
 
